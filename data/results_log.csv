@@ -1,1 +1,7 @@
-tournament_id,tournament_name,start_time,processed_at,Pseudo,Position,GainCash,Bounty,Reentry,buyin_total
+Pseudo,Position,GainCash,Bounty,Recaves,buyin_total,start_time,tournament_id,tournament_name,processed_at
+Krazy Kat,1,35.1,0.0,0,10.0,2025-08-31 21:15:00,a7f97d0cccb1cfb0e2404a6486f7cd2a3e6eb269,CoronaMax VII - Filetonfric 01,2025-08-31 21:15:00
+Nolimythe,2,18.9,0.0,0,10.0,2025-08-31 21:15:00,a7f97d0cccb1cfb0e2404a6486f7cd2a3e6eb269,CoronaMax VII - Filetonfric 01,2025-08-31 21:15:00
+123CYRILLE,3,0.0,0.0,0,10.0,2025-08-31 21:15:00,a7f97d0cccb1cfb0e2404a6486f7cd2a3e6eb269,CoronaMax VII - Filetonfric 01,2025-08-31 21:15:00
+odrAAdeKK,4,0.0,0.0,0,10.0,2025-08-31 21:15:00,a7f97d0cccb1cfb0e2404a6486f7cd2a3e6eb269,CoronaMax VII - Filetonfric 01,2025-08-31 21:15:00
+shark feeder,5,0.0,0.0,0,10.0,2025-08-31 21:15:00,a7f97d0cccb1cfb0e2404a6486f7cd2a3e6eb269,CoronaMax VII - Filetonfric 01,2025-08-31 21:15:00
+Bisat,6,0.0,0.0,0,10.0,2025-08-31 21:15:00,a7f97d0cccb1cfb0e2404a6486f7cd2a3e6eb269,CoronaMax VII - Filetonfric 01,2025-08-31 21:15:00
