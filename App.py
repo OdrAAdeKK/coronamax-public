@@ -351,13 +351,37 @@ if page == "🏆 Tableau":
                 st.download_button("⬇️ Télécharger le JPG", data=Path(jp).read_bytes(),
                                    file_name=Path(jp).name, type="secondary")
 
-    # Publication snapshot (local uniquement)
-    if not IS_PUBLIC:
-        st.subheader("Publication (snapshot public)")
-        if st.button("📤 Générer le snapshot local"):
-            ok, msg = publish_public_snapshot()
-            st.success("Snapshot publique publiée ✅" if ok else "Échec") 
+# Publication snapshot (local + GitHub)
+if not IS_PUBLIC:
+    st.subheader("Publication (snapshot public)")
+
+    c1, c2 = st.columns(2)
+
+    # --- Génération locale uniquement (écrit dans BASE/data/)
+    with c1:
+        if st.button("💾 Générer le snapshot local", key="snap_local"):
+            try:
+                ok, msg = publish_public_snapshot(push_to_github=False)
+            except TypeError:
+                # Compat avec ancienne signature (local par défaut)
+                ok, msg = publish_public_snapshot()
+            (st.success if ok else st.error)("Snapshot local généré ✅" if ok else "Échec génération ❌")
             st.caption(msg)
+
+    # --- Publication sur GitHub (écrit dans data/ + push API GitHub)
+    with c2:
+        if st.button("🚀 Publier sur GitHub", key="snap_push"):
+            try:
+                ok, msg = publish_public_snapshot(
+                    push_to_github=True,
+                    message="CoronaMax: MAJ snapshot public"
+                )
+            except TypeError:
+                ok, msg = (False, "Ta fonction publish_public_snapshot ne supporte pas push_to_github=True. Mets à jour app_classement_unique.py.")
+            (st.success if ok else st.error)("Publication effectuée ✅" if ok else "Échec publication ❌")
+            st.caption(msg)
+
+    st.caption("Local = écrit les CSV dans data/. GitHub = même chose + push dans ton dépôt public (data/**).")
 
 # ==========
 # PAGE 2 — Importer (LOCAL uniquement)

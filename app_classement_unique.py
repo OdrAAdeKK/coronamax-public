@@ -6,6 +6,8 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Iterable, Optional
 import unicodedata
+import base64, requests
+
 from pdfminer.high_level import extract_text as _pdfminer_extract_text
 try:
     from PyPDF2 import PdfReader
@@ -33,6 +35,9 @@ JOURNAL_CSV = ARCHIVE / "journal.csv"
 for d in (ARCHIVE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+IS_PUBLIC = os.getenv("CMX_MODE", "local").lower() == "public"
+
+
 # ==============
 # Schémas (UNIFIÉS)
 # ==============
@@ -44,6 +49,8 @@ RESULTS_LOG_COLUMNS = [
     "Reentry", "buyin_total",
 ]
 JOURNAL_COLUMNS = ["sha1", "filename", "processed_at"]
+
+
 
 # ==============
 # Utilitaires argent / saison
@@ -69,6 +76,75 @@ def current_season_bounds(today: Optional[date] = None) -> tuple[date, date]:
     season_start = date(year if today >= date(year,8,1) else year-1, 8, 1)
     season_end   = date(season_start.year+1, 7, 31)
     return season_start, season_end
+
+def _github_upsert_files(repo: str, token: str, branch: str, files: dict[str, bytes], folder: str = "data") -> list[str]:
+    """
+    Crée/maj des fichiers dans un dépôt GitHub via l'API Contents.
+    files: {"nom.csv": b"...", ...}
+    Retourne la liste des chemins upsertés.
+    """
+    api = "https://api.github.com"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+    touched = []
+    for name, blob in files.items():
+        path = f"{folder}/{name}"
+        # récupère le SHA s'il existe déjà
+        r = requests.get(f"{api}/repos/{repo}/contents/{path}?ref={branch}", headers=headers, timeout=30)
+        sha = r.json().get("sha") if r.status_code == 200 else None
+
+        payload = {
+            "message": f"CoronaMax: update {path}",
+            "content": base64.b64encode(blob).decode("ascii"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        r = requests.put(f"{api}/repos/{repo}/contents/{path}", headers=headers, json=payload, timeout=60)
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"Push GitHub échoué pour {path}: {r.status_code} {r.text}")
+        touched.append(path)
+    return touched
+
+
+def _build_public_snapshot_files() -> dict[str, bytes]:
+    """
+    Construit les blobs à publier dans data/ :
+      - results_log.csv, journal.csv, latest_master.csv, points_table.csv
+      - et les PDFs ARCHIVE/PDF_TRAITES copiés dans data/PDF_Traites/
+    """
+    log = load_results_log_any()
+    journal = load_journal_any()
+    try:
+        classement = standings_from_log(log, season_only=False)
+    except Exception:
+        classement = pd.DataFrame()
+
+    # points sur toute la période dispo
+    if not log.empty:
+        d1 = log["start_time"].min().date()
+        d2 = log["start_time"].max().date()
+        points = compute_points_table(log, d1, d2)
+    else:
+        points = pd.DataFrame(columns=["Place","Pseudo","Parties","ITM","Victoires","Points"])
+
+    files: dict[str, bytes] = {}
+    files["results_log.csv"]   = _normalize_results_log(log).to_csv(index=False).encode("utf-8")
+    files["journal.csv"]       = _normalize_journal(journal).to_csv(index=False).encode("utf-8")
+    files["latest_master.csv"] = classement.to_csv(index=False).encode("utf-8")
+    files["points_table.csv"]  = points.to_csv(index=False).encode("utf-8")
+
+    # PDFs -> sous-dossier data/PDF_Traites
+    pdf_dir = DATA_DIR / "PDF_Traites"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    for p in PDF_DONE.glob("*.pdf"):
+        # on injecte aussi leur contenu dans le dict avec un nom de type "PDF_Traites/nom.pdf"
+        files[f"PDF_Traites/{p.name}"] = p.read_bytes()
+
+    return files
 
 # ==============
 # Normalisation CSV (robuste aux variantes)
@@ -125,8 +201,13 @@ def safe_unlink(p: Path, retries: int = 5, delay: float = 0.2) -> None:
 # Loaders "any" (public ou local)
 # ==============
 def _choose_public_or_local(public_rel: str, local_path: Path) -> Path:
-    pp = DATA_DIR / public_rel
-    return pp if pp.exists() else local_path
+    """En mode PUBLIC on lit data/<file>, sinon on lit toujours le local."""
+    if IS_PUBLIC:
+        pp = DATA_DIR / public_rel
+        return pp if pp.exists() else local_path
+    else:
+        return local_path
+
 
 def load_results_log_any() -> pd.DataFrame:
     p = _choose_public_or_local("results_log.csv", RESULTS_LOG)
@@ -153,7 +234,11 @@ def load_latest_master_any() -> pd.DataFrame:
 
 # Loaders / Savers locaux
 def load_results_log() -> pd.DataFrame:
-    return load_results_log_any()
+    """Toujours le fichier local (utilisé par l’app de traitement)."""
+    p = RESULTS_LOG
+    if not p.exists() or p.stat().st_size == 0:
+        return pd.DataFrame(columns=RESULTS_LOG_COLUMNS)
+    return _normalize_results_log(pd.read_csv(p))
 
 def append_results_log(df_rows: pd.DataFrame) -> None:
     """Append rows to RESULTS_LOG (schéma normalisé)."""
@@ -163,6 +248,7 @@ def append_results_log(df_rows: pd.DataFrame) -> None:
     out.to_csv(RESULTS_LOG, index=False, encoding="utf-8")
 
 def load_journal() -> pd.DataFrame:
+    """Toujours le fichier local (utilisé par l’app de traitement)."""
     p = JOURNAL_CSV
     if not p.exists() or p.stat().st_size == 0:
         return pd.DataFrame(columns=JOURNAL_COLUMNS)
@@ -1017,34 +1103,35 @@ def rollback_last_import() -> dict:
 # ==============
 # Snapshot public (écrit dans data/)
 # ==============
-def publish_public_snapshot(msg: str = "CoronaMax: snapshot publique") -> tuple[bool, str]:
-    log = load_results_log_any()
-    journal = load_journal()
-    try:
-        classement = standings_from_log(log, season_only=False)
-    except Exception:
-        classement = pd.DataFrame()
+def publish_public_snapshot(push_to_github: bool = False, message: str = "CoronaMax: snapshot") -> tuple[bool, str]:
+    """
+    1) Génère le snapshot local dans BASE/data/ (toujours).
+    2) Si push_to_github=True et variables GIT_PUBLIC_REPO / GIT_TOKEN présentes,
+       pousse aussi vers GitHub (branche GIT_BRANCH, défaut 'main') via l'API.
+    """
+    files = _build_public_snapshot_files()
 
-    # points sur la plage complète
-    if not log.empty:
-        d1 = log["start_time"].min().date()
-        d2 = log["start_time"].max().date()
-        points = compute_points_table(log, d1, d2)
-    else:
-        points = pd.DataFrame(columns=["Place","Pseudo","Parties","ITM","Victoires","Points"])
-
+    # Écriture locale dans BASE/data/
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (DATA_DIR / "results_log.csv").write_text(_normalize_results_log(log).to_csv(index=False), encoding="utf-8")
-    (DATA_DIR / "journal.csv").write_text(_normalize_journal(journal).to_csv(index=False), encoding="utf-8")
-    (DATA_DIR / "latest_master.csv").write_text(classement.to_csv(index=False), encoding="utf-8")
-    (DATA_DIR / "points_table.csv").write_text(points.to_csv(index=False), encoding="utf-8")
+    for name, blob in files.items():
+        path = DATA_DIR / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
 
-    # miroir des PDFs archivés
-    pub_pdfs = DATA_DIR / "PDF_Traites"
-    pub_pdfs.mkdir(parents=True, exist_ok=True)
-    for p in PDF_DONE.glob("*.pdf"):
-        dst = pub_pdfs / p.name
-        if not dst.exists():
-            shutil.copy2(p, dst)
+    # Option GitHub
+    if push_to_github:
+        repo   = os.getenv("GIT_PUBLIC_REPO", "").strip()   # ex: "OdrAAdeKK/coronamax-public"
+        token  = os.getenv("GIT_TOKEN", "").strip()
+        branch = os.getenv("GIT_BRANCH", "main").strip()
+        if not repo or not token:
+            return False, "Variables GIT_PUBLIC_REPO et/ou GIT_TOKEN manquantes : aucun push GitHub."
 
-    return True, f"log:{len(log)}; journal:{len(journal)}; classement:{len(classement)}; points:{len(points)} écrit dans data/"
+        # On pousse *tout* sous data/ (CSV + PDFs)
+        try:
+            touched = _github_upsert_files(repo, token, branch, files, folder="data")
+            return True, f"Snapshot locale écrite + {len(touched)} fichier(s) poussé(s) vers {repo}@{branch}."
+        except Exception as e:
+            return False, f"Snapshot locale OK mais push GitHub KO : {e}"
+
+    # Pas de push : snapshot uniquement local
+    return True, "Snapshot locale générée (aucun push GitHub demandé)."
