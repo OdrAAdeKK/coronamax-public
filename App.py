@@ -618,64 +618,131 @@ elif page == "👤 Détails joueur":
     render_player_details(log)
 
 # ==========
-# PAGE 4 — Archives
+# PAGE 4 — 📚 Archives
 # ==========
 elif page == "📚 Archives":
     st.title("Archives")
 
-    # Classement à la date
+    # --- Classement à la date (basé sur la DATE DE TOURNOI, pas la date d'import)
     st.subheader("Classement « à la date »")
     log = load_results_log_any()
     if log.empty:
         st.info("Pas d’historique pour le moment.")
     else:
-        d = st.date_input("Afficher l’état au", value=date.today())
-        sub = log[log["processed_at"].dt.date <= d].copy()
-        table = standings_from_log(sub, season_only=False)
-        show_table(table, caption=f"État arrêté au {d:%d/%m/%Y}")
+        d_cut = st.date_input("Afficher l’état au", value=date.today())
 
-    # PDFs archivés (par saison)
+        # Saison correspondant à cette date (01/08 -> 31/07)
+        s0, s1 = current_season_bounds(d_cut)
+
+        # Filtre : (a) par saison de la date choisie, (b) jusqu'à d_cut inclus
+        df = log.copy()
+        df["__d"] = pd.to_datetime(df["start_time"], errors="coerce").dt.date
+        sub = df[(df["__d"] >= s0) & (df["__d"] <= d_cut)].copy()
+
+        table = standings_from_log(sub, season_only=False)
+        if table.empty:
+            st.info("Aucune donnée jusqu’à cette date dans cette saison.")
+        else:
+            show_table(table, caption=f"État arrêté au {d_cut:%d/%m/%Y} (dates de tournoi)")
+
+    # --- PDFs archivés groupés par saison (à partir de la date dans le nom du fichier)
     st.subheader("PDFs archivés (par saison)")
+
+    # petites helpers locales (pas d'effet ailleurs)
+    import re
+
+    def _parse_dt_from_filename(name: str) -> tuple[date | None, str]:
+        """
+        Essaie d'extraire (date, time_str) depuis "… du 07-09-2025 21:15 …" ou "… du 07-09-2025 2115 …"
+        Retourne (date | None, "HH:MM" ou "").
+        """
+        base = Path(name).stem
+        m = re.search(r"du\s+(\d{2}-\d{2}-\d{4})\s+(\d{2}[:h]?\d{2})", base, flags=re.I)
+        if not m:
+            return None, ""
+        dstr, tstr = m.group(1), m.group(2).lower().replace("h", ":")
+        try:
+            dparts = dstr.split("-")
+            d_obj = date(int(dparts[2]), int(dparts[1]), int(dparts[0]))
+        except Exception:
+            return None, ""
+        if re.fullmatch(r"\d{4}", tstr):
+            tstr = f"{tstr[:2]}:{tstr[2:]}"
+        return d_obj, tstr
+
+    def _season_label(d_obj: date) -> str:
+        """Saison 01/08 -> 31/07."""
+        if d_obj.month >= 8:
+            return f"{d_obj.year}-{d_obj.year+1}"
+        else:
+            return f"{d_obj.year-1}-{d_obj.year}"
+
     pdfs = list_files_sorted(PDF_DONE, ("*.pdf",))
     if not pdfs:
         st.caption("Aucun PDF archivé.")
     else:
-        # group by season label if you already compute one; otherwise flatten list:
-        # For simplicity, show all in one accordion:
-        with st.expander(f"Saison {season_label if 'season_label' in locals() else 'courante'}", expanded=True):
-            for p in pdfs:
-                cols = st.columns([6, 2, 2])
-                # left: name + date
-                cols[0].write(f"**{p.name}**  \n_{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}_")
+        # Regroupe par saison -> liste [(dt, time_str, Path)]
+        seasons: dict[str, list[tuple[date, str, Path]]] = {}
+        for p in pdfs:
+            d_obj, tstr = _parse_dt_from_filename(p.name)
+            if not d_obj:
+                # si on ne trouve pas de date dans le nom, on classe dans "Inconnue"
+                seasons.setdefault("Inconnue", []).append((date.min, "", p))
+                continue
+            lab = _season_label(d_obj)
+            seasons.setdefault(lab, []).append((d_obj, tstr, p))
 
-                # middle: PDF download
-                with cols[1]:
-                    cols[1].download_button(
-                        "Télécharger (PDF)",
-                        data=p.read_bytes(),
-                        file_name=p.name,
-                        type="secondary",
-                        key=f"dlpdf_{p.name}"
-                    )
+        # Affiche saisons par ordre décroissant (2025-2026, puis 2024-2025, …, puis "Inconnue")
+        def _season_sort_key(label: str):
+            if label == "Inconnue":
+                return (0, label)
+            try:
+                y1, y2 = label.split("-")
+                return (int(y1), label)
+            except Exception:
+                return (0, label)
 
-                # right: JPG download (auto-generate if missing or older than PDF)
-                with cols[2]:
-                    try:
-                        jpg_path = SNAP_DIR / "archived_jpg" / (p.stem + ".jpg")
-                        need_regen = (not jpg_path.exists()) or (jpg_path.stat().st_mtime < p.stat().st_mtime)
-                        if need_regen:
-                            pdf_first_page_to_jpg(p, jpg_path, dpi=220)
-                        cols[2].download_button(
-                            "Télécharger (JPG)",
-                            data=jpg_path.read_bytes(),
-                            file_name=jpg_path.name,
+        for season in sorted(seasons.keys(), key=_season_sort_key, reverse=True):
+            with st.expander(f"Saison {season}", expanded=True):
+                # tri décroissant par date de tournoi, puis heure si dispo
+                entries = seasons[season]
+                entries.sort(key=lambda tup: (tup[0], tup[1]), reverse=True)
+
+                for d_obj, tstr, p in entries:
+                    cols = st.columns([6, 2, 2])
+                    # libellé (avec date si connue)
+                    when = f"{d_obj:%Y-%m-%d}" if d_obj != date.min else "date inconnue"
+                    if tstr:
+                        when += f" {tstr}"
+                    cols[0].write(f"**{p.name}**  \n_{when}_")
+
+                    # PDF
+                    with cols[1]:
+                        st.download_button(
+                            "PDF",
+                            data=p.read_bytes(),
+                            file_name=p.name,
                             type="secondary",
-                            key=f"dljpg_{p.name}"
+                            key=f"dlpdf_{p.name}"
                         )
-                    except Exception as e:
-                        # If conversion fails (fitz not installed or other), show a disabled button + hint
-                        st.button("JPG indisponible", disabled=True, key=f"nojpg_{p.name}")
-                        st.caption(f"⚠️ Conversion JPG échouée : {e}")
+
+                    # JPG (génère/actualise si plus ancien que le PDF)
+                    with cols[2]:
+                        try:
+                            jpg_path = SNAP_DIR / "archived_jpg" / (p.stem + ".jpg")
+                            need_regen = (not jpg_path.exists()) or (jpg_path.stat().st_mtime < p.stat().st_mtime)
+                            if need_regen:
+                                pdf_first_page_to_jpg(p, jpg_path, dpi=220)
+                            st.download_button(
+                                "JPG",
+                                data=jpg_path.read_bytes(),
+                                file_name=jpg_path.name,
+                                type="secondary",
+                                key=f"dljpg_{p.name}"
+                            )
+                        except Exception as e:
+                            st.button("JPG indisponible", disabled=True, key=f"nojpg_{p.name}")
+                            st.caption(f"⚠️ Conversion JPG échouée : {e}")
 
 # ==========
 # PAGE — 🏅 Classement par points
