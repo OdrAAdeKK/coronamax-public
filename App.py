@@ -86,6 +86,30 @@ page = st.sidebar.radio("Navigation", READ_PAGES if IS_PUBLIC else ALL_PAGES, ke
 import time
 from pathlib import Path  # si pas déjà présent
 
+# --- Masquer barre/outils Streamlit en mode public (cosmétique) ---
+if IS_PUBLIC:
+    # on vide aussi le menu d'aide
+    st.set_page_config(menu_items={
+        "Get help": None, "Report a bug": None, "About": None
+    })
+
+    HIDE_CLOUD_CHROME = """
+    <style>
+    /* top header + toolbar */
+    [data-testid="stHeader"] { display: none !important; }
+    [data-testid="stToolbar"] { display: none !important; }
+    /* footer (ancien sélecteur) */
+    footer { visibility: hidden !important; }
+    /* badge / bouton 'Manage app' (plusieurs variantes de classes) */
+    .viewerBadge_container__1QSob,
+    .viewerBadge_container__2QS2_,
+    .viewerBadge_link__1S137,
+    a[title="Manage app"] { display: none !important; }
+    </style>
+    """
+    st.markdown(HIDE_CLOUD_CHROME, unsafe_allow_html=True)
+
+
 # --- PDF → JPG (first page) ---------------------------------------------------
 def pdf_first_page_to_jpg(pdf_path: Path, jpg_path: Path, dpi: int = 220) -> Path:
     """
