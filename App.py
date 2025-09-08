@@ -885,62 +885,76 @@ elif page == "🏅 Classement par points":
     from pathlib import Path
     from datetime import datetime
     from app_classement_unique import (
+        SNAP_DIR,                     # <-- needed for JPG path
         load_results_log_any,
+        load_points_table_any,        # <-- snapshot loader
         compute_points_table,
         current_season_bounds,
-        classement_points_df_to_jpg,  # <- la fonction JPG que tu as ajoutée
+        classement_points_df_to_jpg,  # JPG export helper
         euro,
     )
 
     st.title("Classement général — Points")
 
-    log = load_results_log_any()
-    if log is None or log.empty:
-        st.info("Aucune donnée pour l’instant. Va dans **Importer** pour traiter des PDFs.")
-    else:
-        # Sélection de période (par défaut : saison courante)
+    # 1) Essayer d'abord le snapshot public (data/points_table.csv)
+    pts_table = load_points_table_any()
+    used_snapshot = pts_table is not None and not pts_table.empty
+
+    if not used_snapshot:
+        # 2) Fallback : calculer depuis le log (avec filtre de période)
+        log = load_results_log_any()
+        if log is None or log.empty:
+            st.info("Aucune donnée pour l’instant. Va dans **Importer** pour traiter des PDFs.")
+            return
+
+        # Période par défaut = saison courante
         s0, s1 = current_season_bounds()
         with st.expander("Filtrer par période (saison active par défaut)", expanded=False):
-            d1 = st.date_input("Du", value=s0)
-            d2 = st.date_input("Au", value=s1)
+            d1 = st.date_input("Du", value=s0, key="pts_d1")
+            d2 = st.date_input("Au", value=s1, key="pts_d2")
 
-        # Table points
-        pts = compute_points_table(log, d1, d2)
-        if pts.empty:
+        pts_table = compute_points_table(log, d1, d2)
+        if pts_table.empty:
             st.info("Pas de résultats sur cette période.")
-        else:
-            st.dataframe(pts, use_container_width=True, hide_index=True)
+            return
+        caption = f"Période {d1:%d/%m/%Y} → {d2:%d/%m/%Y}"
+    else:
+        caption = "Snapshot public (data/points_table.csv)"
 
-            # Export CSV
+    # --- Affichage du tableau
+    st.dataframe(pts_table, use_container_width=True, hide_index=True)
+    st.caption(caption)
+
+    # --- Export CSV
+    st.download_button(
+        "⬇️ Exporter (CSV Points)",
+        data=pts_table.to_csv(index=False).encode("utf-8"),
+        file_name="classement_points.csv",
+        type="secondary",
+    )
+
+    # --- Export JPG (largeur auto pour éviter le rognage)
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("🖼️ Exporter le classement Points en JPG", key="btn_pts_jpg"):
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                jpg_path = SNAP_DIR / f"classement_points_{ts}.jpg"
+                classement_points_df_to_jpg(pts_table, jpg_path)
+                st.session_state["last_points_jpg_export"] = str(jpg_path)
+                st.success("JPG (Points) généré.")
+            except Exception as e:
+                st.error(f"Export impossible : {e}")
+
+    with c2:
+        jp = st.session_state.get("last_points_jpg_export")
+        if jp and Path(jp).exists():
             st.download_button(
-                "⬇️ Exporter (CSV Points)",
-                data=pts.to_csv(index=False).encode("utf-8"),
-                file_name="classement_points.csv",
+                "⬇️ Télécharger le JPG (Points)",
+                data=Path(jp).read_bytes(),
+                file_name=Path(jp).name,
                 type="secondary",
             )
-
-            # Export JPG (largeur auto pour éviter le rognage)
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                if st.button("🖼️ Exporter le classement Points en JPG"):
-                    try:
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        jpg_path = SNAP_DIR / f"classement_points_{ts}.jpg"
-                        classement_points_df_to_jpg(pts, jpg_path)
-                        st.session_state["last_points_jpg_export"] = str(jpg_path)
-                        st.success("JPG (Points) généré.")
-                    except Exception as e:
-                        st.error(f"Export impossible : {e}")
-
-            with c2:
-                jp = st.session_state.get("last_points_jpg_export")
-                if jp and Path(jp).exists():
-                    st.download_button(
-                        "⬇️ Télécharger le JPG (Points)",
-                        data=Path(jp).read_bytes(),
-                        file_name=Path(jp).name,
-                        type="secondary",
-                    )
 
 # ==========
 # PAGE 6 — Réinitialiser (LOCAL uniquement)
