@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 import unicodedata
 import base64, requests
+from urllib.parse import quote
+import subprocess
+import base64
 
 from pdfminer.high_level import extract_text as _pdfminer_extract_text
 try:
@@ -14,6 +17,10 @@ try:
 except Exception:
     PdfReader = None
 
+import streamlit as st
+for k in ("GIT_PUBLIC_REPO","GIT_TOKEN","GIT_BRANCH","GIT_AUTHOR"):
+    if k in st.secrets and st.secrets[k]:
+        os.environ[k] = str(st.secrets[k])
 
 import numpy as np
 import pandas as pd
@@ -108,6 +115,78 @@ def _github_upsert_files(repo: str, token: str, branch: str, files: dict[str, by
             raise RuntimeError(f"Push GitHub échoué pour {path}: {r.status_code} {r.text}")
         touched.append(path)
     return touched
+
+def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+    """Exécute une commande et renvoie (rc, log)."""
+    try:
+        p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, shell=False)
+        out = (p.stdout or "") + (p.stderr or "")
+        return p.returncode, out.strip()
+    except Exception as e:
+        return 1, f"EXC:{e}"
+
+def _authed_repo_url(repo: str, token: str) -> str:
+    # Evite caractères spéciaux dans le token
+    t = quote(token, safe="")
+    return f"https://x-access-token:{t}@github.com/{repo}.git"
+
+def _ensure_pub_repo(local_dir: Path, repo: str, token: str, branch: str) -> tuple[bool, str]:
+    """
+    Prépare le dépôt local .pubpush/repo :
+      - clone si besoin avec URL authentifiée
+      - sinon, s’assure que 'origin' pointe vers l’URL authentifiée
+      - checkout sur la branche voulue
+    """
+    logs = []
+    url = _authed_repo_url(repo, token)
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    git_dir = local_dir / ".git"
+
+    if not git_dir.exists():
+        # clone propre
+        rc, out = _run(["git", "clone", "--depth", "1", "--branch", branch, url, str(local_dir.name)], cwd=local_dir.parent)
+        logs.append(f"clone: rc={rc} {out}")
+        if rc != 0:
+            return False, "\n".join(logs)
+    else:
+        # s’assure que le remote a bien l’URL authentifiée
+        rc, _ = _run(["git", "remote", "set-url", "origin", url], cwd=local_dir)
+        logs.append(f"set-url: rc={rc}")
+        # fetch + checkout
+        rc, out = _run(["git", "fetch", "origin", branch], cwd=local_dir)
+        logs.append(f"fetch: rc={rc} {out}")
+        rc, out = _run(["git", "checkout", branch], cwd=local_dir)
+        logs.append(f"checkout: rc={rc} {out}")
+
+    # Config auteur (au cas où)
+    _run(["git", "config", "user.name", "CoronaMax Bot"], cwd=local_dir)
+    _run(["git", "config", "user.email", "bot@example.invalid"], cwd=local_dir)
+
+    return True, "\n".join(logs)
+
+def _git_push_all(local_dir: Path, repo: str, token: str, branch: str) -> tuple[bool, str]:
+    """
+    Ajoute/commit et pousse vers la branche (avec URL authentifiée explicite au push).
+    """
+    logs = []
+
+    # add
+    rc, out = _run(["git", "add", "-A"], cwd=local_dir)
+    logs.append(f"git add: rc={rc} {out}")
+    if rc != 0:
+        return False, "\n".join(logs)
+
+    # commit (peut renvoyer rc=1 si rien à committer — on tolère)
+    rc, out = _run(["git", "commit", "-m", "CoronaMax: snapshot public"], cwd=local_dir)
+    logs.append(f"git commit: rc={rc} {out}")
+
+    # push avec URL authentifiée *directement* pour être sûr que le token est pris en compte
+    url = _authed_repo_url(repo, token)
+    rc, out = _run(["git", "push", url, f"HEAD:{branch}"], cwd=local_dir)
+    logs.append(f"git push: rc={rc} {out}")
+
+    return (rc == 0), "\n".join(logs)
 
 
 def _build_public_snapshot_files() -> dict[str, bytes]:
@@ -209,11 +288,46 @@ def _choose_public_or_local(public_rel: str, local_path: Path) -> Path:
         return local_path
 
 
+def _try_read_csv_any(path: Path):
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception:
+            continue
+    return None
+
 def load_results_log_any() -> pd.DataFrame:
-    p = _choose_public_or_local("results_log.csv", RESULTS_LOG)
-    if not p.exists() or p.stat().st_size == 0:
-        return pd.DataFrame(columns=RESULTS_LOG_COLUMNS)
-    return _normalize_results_log(pd.read_csv(p))
+    candidates = [
+        DATA_DIR / "results_log.csv",
+        BASE / "data" / "results_log.csv",
+        Path("data") / "results_log.csv",
+    ]
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0:
+            df = _try_read_csv_any(p)
+            if df is not None and not df.empty:
+                return _normalize_results_log(df)
+
+    # fallback local (ARCHIVE) si jamais
+    if RESULTS_LOG.exists() and RESULTS_LOG.stat().st_size > 0:
+        df = _try_read_csv_any(RESULTS_LOG)
+        if df is not None and not df.empty:
+            return _normalize_results_log(df)
+
+    return pd.DataFrame(columns=RESULTS_LOG_COLUMNS)
+
+def load_points_table_any() -> pd.DataFrame:
+    p = DATA_DIR / "points_table.csv"
+    if p.exists() and p.stat().st_size > 0:
+        try:
+            df = pd.read_csv(p, encoding="utf-8")
+        except Exception:
+            df = pd.read_csv(p, encoding="utf-8-sig")
+        # garde les colonnes attendues si présentes
+        want = ["Place", "Pseudo", "Parties", "ITM", "Victoires", "Points"]
+        keep = [c for c in want if c in df.columns]
+        return df[keep] if keep else df
+    return pd.DataFrame()
 
 def load_journal_any() -> pd.DataFrame:
     p = _choose_public_or_local("journal.csv", JOURNAL_CSV)
@@ -1105,33 +1219,170 @@ def rollback_last_import() -> dict:
 # ==============
 def publish_public_snapshot(push_to_github: bool = False, message: str = "CoronaMax: snapshot") -> tuple[bool, str]:
     """
-    1) Génère le snapshot local dans BASE/data/ (toujours).
-    2) Si push_to_github=True et variables GIT_PUBLIC_REPO / GIT_TOKEN présentes,
-       pousse aussi vers GitHub (branche GIT_BRANCH, défaut 'main') via l'API.
+    1) Écrit le snapshot local dans BASE/data/ (toujours).
+    2) Si push_to_github=True et GIT_PUBLIC_REPO / GIT_TOKEN sont présents,
+       pousse aussi vers GitHub (branche GIT_BRANCH, défaut 'main') en HTTPS
+       avec en-tête Authorization: Basic <base64(owner:token)>.
     """
+    # ---- 1) Construire + écrire localement
     files = _build_public_snapshot_files()
-
-    # Écriture locale dans BASE/data/
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     for name, blob in files.items():
-        path = DATA_DIR / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(blob)
+        p = DATA_DIR / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(blob)
 
-    # Option GitHub
-    if push_to_github:
-        repo   = os.getenv("GIT_PUBLIC_REPO", "").strip()   # ex: "OdrAAdeKK/coronamax-public"
-        token  = os.getenv("GIT_TOKEN", "").strip()
-        branch = os.getenv("GIT_BRANCH", "main").strip()
-        if not repo or not token:
-            return False, "Variables GIT_PUBLIC_REPO et/ou GIT_TOKEN manquantes : aucun push GitHub."
+    if not push_to_github:
+        return True, "Snapshot locale générée (aucun push GitHub demandé)."
 
-        # On pousse *tout* sous data/ (CSV + PDFs)
-        try:
-            touched = _github_upsert_files(repo, token, branch, files, folder="data")
-            return True, f"Snapshot locale écrite + {len(touched)} fichier(s) poussé(s) vers {repo}@{branch}."
-        except Exception as e:
-            return False, f"Snapshot locale OK mais push GitHub KO : {e}"
+    # ---- 2) Paramètres GitHub
+    repo_input = os.getenv("GIT_PUBLIC_REPO", "").strip()   # "owner/repo" ou URL complète
+    token      = os.getenv("GIT_TOKEN", "").strip()
+    branch     = os.getenv("GIT_BRANCH", "main").strip()
+    author     = os.getenv("GIT_AUTHOR", "CoronaBot <bot@example.com>").strip()
 
-    # Pas de push : snapshot uniquement local
-    return True, "Snapshot locale générée (aucun push GitHub demandé)."
+    if not repo_input or not token:
+        return False, "Variables GIT_PUBLIC_REPO et/ou GIT_TOKEN manquantes : aucun push GitHub."
+
+    def _slug_from(repo_or_url: str) -> str | None:
+        if repo_or_url.lower().startswith("http"):
+            m = re.match(r"https?://(?:[^@]+@)?github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", repo_or_url, flags=re.I)
+            return m.group(1) if m else None
+        return repo_or_url if "/" in repo_or_url else None
+
+    slug = _slug_from(repo_input)
+    if not slug:
+        return False, f"Repo invalide: {repo_input!r} (attendu 'owner/repo' ou URL GitHub)"
+
+    owner = slug.split("/")[0]
+    clean_url = f"https://github.com/{slug}.git"
+
+    # Prépare le Basic auth header: base64("OWNER:TOKEN") — GitHub accepte OWNER = propriétaire du PAT
+    basic = base64.b64encode(f"{owner}:{token}".encode("utf-8")).decode("ascii")
+    extra_header = f"AUTHORIZATION: Basic {basic}"
+
+    work = BASE / ".pubpush"
+    repo = work / "repo"
+    work.mkdir(parents=True, exist_ok=True)
+
+    outlog: list[str] = []
+
+
+    def run(cmd, cwd=None, env=None):
+        rc, out = _git_run(cmd, cwd=cwd, env=env)
+        # journal lisible, mais sans secrets
+        cmd_str = " ".join(cmd)
+        for secret in (token, basic):
+            if secret:
+                cmd_str = cmd_str.replace(secret, "****")
+                out     = out.replace(secret, "****")
+        outlog.append(f"$ {cmd_str}\nrc={rc}\n{out}".strip())
+        return rc, out
+
+
+    # (A) Préparer le dépôt local
+    try:
+        if repo.exists() and (repo / ".git").exists():
+            run(["git", "remote", "set-url", "origin", clean_url], cwd=repo)
+            run(["git", "fetch", "origin", branch], cwd=repo)
+            run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo)
+        else:
+            if repo.exists():
+                shutil.rmtree(repo, ignore_errors=True)
+            run(["git", "clone", "--branch", branch, clean_url, str(repo)], cwd=work)
+        outlog.append("prepare: repo prêt")
+    except Exception as e:
+        outlog.append(f"prepare: clone/config KO: {e}")
+        return False, "\n\n".join(outlog)
+
+    # (B) Configure identité + header auth
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"]     = (author.split("<")[0].strip() or "CoronaBot")
+    env["GIT_AUTHOR_EMAIL"]    = (author.split("<")[-1].strip(">").strip() or "bot@example.com")
+    env["GIT_COMMITTER_NAME"]  = env["GIT_AUTHOR_NAME"]
+    env["GIT_COMMITTER_EMAIL"] = env["GIT_AUTHOR_EMAIL"]
+
+    # on configure l’en-tête, mais on n’affiche pas sa valeur
+    _rc, _out = _git_run(["git","config", "http.https://github.com/.extraheader", extra_header], cwd=repo, env=env)
+    outlog.append("$ git config http.https://github.com/.extraheader **set**")
+
+
+    try:
+        # (C) Copier data/
+        (repo / "data").mkdir(parents=True, exist_ok=True)
+        for p in DATA_DIR.rglob("*"):
+            if p.is_file():
+                rel = p.relative_to(DATA_DIR)
+                dst = repo / "data" / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dst)
+
+        # (D) Commit + push
+        rc, _ = run(["git", "add", "-A"], cwd=repo, env=env)
+        if rc != 0:
+            return False, "\n\n".join(outlog)
+
+        rc, _ = run(["git", "commit", "-m", message], cwd=repo, env=env)
+        # rc==1 si "nothing to commit" -> ok, on push quand même
+
+        rc, _ = run(["git", "push", "-u", "origin", branch], cwd=repo, env=env)
+        if rc != 0:
+            return False, "\n\n".join(outlog)
+
+        return True, "\n\n".join(outlog)
+    finally:
+        # Retire le header pour ne pas le laisser dans la config
+        run(["git", "config", "--unset-all", f"http.https://github.com/.extraheader"], cwd=repo, env=env)
+
+
+
+def _git_run(cmd: list[str], cwd: Path | None = None, env: dict | None = None, timeout: int = 60) -> tuple[int, str]:
+    """Exécute une commande git, retourne (rc, stdout|stderr)."""
+    try:
+        r = subprocess.run(cmd, cwd=str(cwd) if cwd else None,
+                           capture_output=True, text=True, env=env, timeout=timeout)
+        out = (r.stdout.strip() or r.stderr.strip())
+        return r.returncode, out
+    except Exception as e:
+        return 1, f"EXC:{e}"
+
+
+def _ensure_pub_repo(repo_url: str, token: str, branch: str, repo_dir: Path) -> tuple[bool, str]:
+    """
+    Prépare .pubpush/repo :
+      - clone si absent,
+      - sinon reconfigure l'origin, fetch et checkout branche,
+      - ajoute safe.directory pour éviter 'dubious ownership' (NAS/Windows).
+    """
+    # URL avec token encodé
+    safe = quote(token, safe="")  # URL-encode (token peut contenir _ ou autres)
+    url_with_token = repo_url.replace("https://", f"https://x-access-token:{safe}@")
+
+    # si le dossier existe mais n'est pas un repo -> on l'efface
+    if repo_dir.exists() and not (repo_dir / ".git").exists():
+        shutil.rmtree(repo_dir, ignore_errors=True)
+
+    # clone si nécessaire
+    if not (repo_dir / ".git").exists():
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir, ignore_errors=True)
+        rc, out = _git_run(["git","clone","--depth","1","--branch", branch, url_with_token, str(repo_dir)])
+        if rc != 0:
+            return False, f"clone KO: {out}"
+
+    # safe.directory (Windows/NAS)
+    _git_run(["git","config","--global","--add","safe.directory", str(repo_dir).replace("\\","/")])
+
+    # assure la bonne origin + fetch + checkout
+    _git_run(["git","remote","set-url","origin", url_with_token], cwd=repo_dir)
+    _git_run(["git","fetch","origin", branch], cwd=repo_dir)
+    rc, out = _git_run(["git","checkout", branch], cwd=repo_dir)
+    if rc != 0:
+        # créer la branche si elle n'existe pas localement
+        rc, out = _git_run(["git","checkout","-b", branch], cwd=repo_dir)
+        if rc != 0:
+            return False, f"checkout KO: {out}"
+    # rebase sur origin/branch (au cas où)
+    _git_run(["git","pull","--rebase","origin", branch], cwd=repo_dir)
+
+    return True, "repo prêt"
