@@ -885,18 +885,18 @@ elif page == "🏅 Classement par points":
     from pathlib import Path
     from datetime import datetime
     from app_classement_unique import (
-        SNAP_DIR,                     # <-- needed for JPG path
+        SNAP_DIR,
         load_results_log_any,
-        load_points_table_any,        # <-- snapshot loader
+        load_points_table_any,
         compute_points_table,
         current_season_bounds,
-        classement_points_df_to_jpg,  # JPG export helper
+        classement_points_df_to_jpg,
         euro,
     )
 
     st.title("Classement général — Points")
 
-    # 1) Essayer d'abord le snapshot public (data/points_table.csv)
+    # 1) Essayer d'abord le snapshot (data/points_table.csv)
     pts_table = load_points_table_any()
     used_snapshot = pts_table is not None and not pts_table.empty
 
@@ -905,7 +905,7 @@ elif page == "🏅 Classement par points":
         log = load_results_log_any()
         if log is None or log.empty:
             st.info("Aucune donnée pour l’instant. Va dans **Importer** pour traiter des PDFs.")
-            return
+            st.stop()
 
         # Période par défaut = saison courante
         s0, s1 = current_season_bounds()
@@ -916,12 +916,12 @@ elif page == "🏅 Classement par points":
         pts_table = compute_points_table(log, d1, d2)
         if pts_table.empty:
             st.info("Pas de résultats sur cette période.")
-            return
+            st.stop()
         caption = f"Période {d1:%d/%m/%Y} → {d2:%d/%m/%Y}"
     else:
         caption = "Snapshot public (data/points_table.csv)"
 
-    # --- Affichage du tableau
+    # --- Affichage
     st.dataframe(pts_table, use_container_width=True, hide_index=True)
     st.caption(caption)
 
@@ -955,6 +955,7 @@ elif page == "🏅 Classement par points":
                 file_name=Path(jp).name,
                 type="secondary",
             )
+
 
 # ==========
 # PAGE 6 — Réinitialiser (LOCAL uniquement)
