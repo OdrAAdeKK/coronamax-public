@@ -5,3 +5,4 @@ altair>=5.3
 pdfplumber>=0.11
 pillow>=10.4
 matplotlib>=3.9
+pymupdf>=1.23
