@@ -74,13 +74,43 @@ JOURNAL_COLUMNS = [
     "processed_at",      # date/heure de traitement (ISO)
 ]
 
-# ==========
-# Sidebar (unique)
+# --- Mode admin / public -----------------------------------------------
+import os
+import streamlit as st
+
+def _get_query_param(name: str) -> str:
+    # compatibilité st.query_params / experimental_get_query_params
+    try:
+        v = st.query_params.get(name, "")
+        if isinstance(v, list):
+            return v[0] if v else ""
+        return v
+    except Exception:
+        return st.experimental_get_query_params().get(name, [""])[0]
+
+ADMIN_KEY = str(st.secrets.get("ADMIN_KEY", "")).strip()
+
+IS_ADMIN = (
+    os.getenv("ADMIN_MODE", "").strip() == "1"              # en local: set ADMIN_MODE=1
+    or (ADMIN_KEY and _get_query_param("admin") == ADMIN_KEY)  # en prod: ?admin=VOTRECLE
+)
+
+# pour compatibilité avec ton code existant
+IS_PUBLIC = not IS_ADMIN
+# -----------------------------------------------------------------------
+
+
+# ========== 
+# Sidebar (navigation)
 # ==========
 st.sidebar.title("CoronaMax")
-ALL_PAGES  = ["🏆 Tableau","👤 Détails joueur","📚 Archives","🏅 Classement par points","⬆️ Importer","♻️ Réinitialiser"]
-READ_PAGES = ["🏆 Tableau","👤 Détails joueur","📚 Archives","🏅 Classement par points"]
-page = st.sidebar.radio("Navigation", READ_PAGES if IS_PUBLIC else ALL_PAGES, key="nav_main")
+
+nav_public = ["🏆 Tableau", "👤 Détails joueur", "📚 Archives", "🏅 Classement par points"]
+nav_admin  = nav_public + ["⬆️ Importer", "♻️ Réinitialiser"]
+
+pages = nav_admin if IS_ADMIN else nav_public
+page = st.sidebar.radio("Navigation", pages, index=0, key="nav_main", label_visibility="collapsed")
+
 
 # --- à mettre près des imports en haut de App.py ---
 import time
@@ -108,6 +138,41 @@ if IS_PUBLIC:
     </style>
     """
     st.markdown(HIDE_CLOUD_CHROME, unsafe_allow_html=True)
+
+# --- Mode Admin : OFF par défaut (public). On l’active avec une clé.
+import os, streamlit as st
+
+ADMIN_KEY = st.secrets.get("ADMIN_KEY", "")          # définis ce secret sur Streamlit Cloud
+if "admin_ok" not in st.session_state:
+    st.session_state["admin_ok"] = False
+
+def is_admin() -> bool:
+    # En local tu peux mettre ADMIN_MODE=1 dans tes variables d'env pour ne pas taper la clé
+    if os.environ.get("ADMIN_MODE", "0") == "1":
+        return True
+    if ADMIN_KEY and st.session_state.get("admin_ok"):
+        return True
+    return False
+
+# Petit panneau de déverrouillage dans la sidebar
+with st.sidebar:
+    if not is_admin():
+        with st.expander("🔒 Mode admin", expanded=False):
+            adm_try = st.text_input("Clé admin", type="password", key="adm_key")
+            if st.button("Déverrouiller", key="adm_unlock"):
+                if ADMIN_KEY and adm_try == ADMIN_KEY:
+                    st.session_state["admin_ok"] = True
+                    st.rerun()
+                else:
+                    st.error("Clé invalide")
+    else:
+        st.caption("🔓 Mode admin activé")
+        if st.button("Se déconnecter", key="adm_logout"):
+            st.session_state["admin_ok"] = False
+            st.rerun()
+
+IS_ADMIN  = is_admin()
+IS_PUBLIC = not IS_ADMIN
 
 
 # --- PDF → JPG (first page) ---------------------------------------------------
@@ -352,7 +417,7 @@ if page == "🏆 Tableau":
                                    file_name=Path(jp).name, type="secondary")
 
 # Publication snapshot (local + GitHub)
-if not IS_PUBLIC:
+if IS_ADMIN:
     st.subheader("Publication (snapshot public)")
 
     c1, c2 = st.columns(2)
@@ -386,7 +451,7 @@ if not IS_PUBLIC:
 # ==========
 # PAGE 2 — Importer (LOCAL uniquement)
 # ==========
-elif page == "⬆️ Importer" and not IS_PUBLIC:
+elif page == "⬆️ Importer" and IS_ADMIN:
     st.title("Importer des résultats (PDF Winamax)")
     if "pending_tourneys" not in st.session_state:
         st.session_state["pending_tourneys"] = {}
@@ -859,7 +924,7 @@ elif page == "🏅 Classement par points":
 # ==========
 # PAGE 6 — Réinitialiser (LOCAL uniquement)
 # ==========
-elif page == "♻️ Réinitialiser" and not IS_PUBLIC:
+elif page == "♻️ Réinitialiser" and IS_ADMIN:
     st.title("Réinitialiser la saison courante")
     st.warning("Attention : remise à zéro des agrégats. Les PDFs archivés peuvent être re-traités ensuite.")
 
