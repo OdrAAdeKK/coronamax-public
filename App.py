@@ -9,6 +9,8 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 import shutil
+import subprocess
+from urllib.parse import quote
 
 from app_classement_unique import (
     BASE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR,
@@ -174,6 +176,23 @@ with st.sidebar:
 IS_ADMIN  = is_admin()
 IS_PUBLIC = not IS_ADMIN
 
+
+
+def get_conf(name: str, default: str = "") -> str:
+    """Lit d'abord st.secrets[name], sinon la variable d'environnement du même nom."""
+    try:
+        v = st.secrets.get(name, "")
+    except Exception:
+        v = ""
+    if not str(v).strip():
+        v = os.getenv(name, "")
+    v = str(v).strip()
+    return v or default
+
+def mask(s: str, keep: int = 4) -> str:
+    s = str(s or "")
+    return (s[:keep] + "…" + "*" * 6) if len(s) > keep else ("*" * len(s))
+# ----------------------------------------------------------------------------
 
 # --- PDF → JPG (first page) ---------------------------------------------------
 def pdf_first_page_to_jpg(pdf_path: Path, jpg_path: Path, dpi: int = 220) -> Path:
@@ -727,8 +746,10 @@ elif page == "👤 Détails joueur":
         hist = hist.sort_values("Date")
         st.dataframe(hist, use_container_width=True, hide_index=True)
 
-    log = load_results_log()         # (déjà importée en haut du fichier)
+    from app_classement_unique import load_results_log_any
+    log = load_results_log_any()
     render_player_details(log)
+
 
 # ==========
 # PAGE 4 — 📚 Archives
