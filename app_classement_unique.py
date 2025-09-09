@@ -1,41 +1,71 @@
 # app_classement_unique.py
 from __future__ import annotations
-import os, re, io, shutil, hashlib, json, time
+
+import os, re, io, shutil, hashlib, json, time, sys, subprocess
 from dataclasses import dataclass
 from datetime import datetime, date
 from pathlib import Path
 from typing import Iterable, Optional
 import unicodedata
-import base64, requests
 from urllib.parse import quote
-import subprocess
-import base64
-
-from pdfminer.high_level import extract_text as _pdfminer_extract_text
-try:
-    from PyPDF2 import PdfReader
-except Exception:
-    PdfReader = None
-
-import streamlit as st
-for k in ("GIT_PUBLIC_REPO","GIT_TOKEN","GIT_BRANCH","GIT_AUTHOR"):
-    if k in st.secrets and st.secrets[k]:
-        os.environ[k] = str(st.secrets[k])
 
 import numpy as np
 import pandas as pd
 
-# ==============
-# Chemins
-# ==============
-BASE = Path(__file__).parent.resolve()
-ARCHIVE = BASE / "ARCHIVE"
-PDF_DIR = BASE / "PDF_A_TRAITER"
-PDF_DONE = ARCHIVE / "PDF_TRAITES"
-SNAP_DIR = BASE / "SNAPSHOTS"
-DATA_DIR = BASE / "data"           # snapshot public
+# -- streamlit est optionnel ici : on protège l'accès à secrets
+try:
+    import streamlit as st
+except Exception:
+    st = None  # type: ignore
 
-F_MASTER = BASE / "GAINS_Wina.xlsx"  # facultatif (fallback local)
+
+# =============================================================================
+# Bases & secrets → env (marche en local, en exe, et en Streamlit Cloud)
+# =============================================================================
+
+def _app_base() -> Path:
+    """
+    Racine de l'app :
+    - si CMX_BASE_DIR est défini -> utilise ce dossier (EXE portable)
+    - sinon si bundlé (sys.frozen) -> dossier de l'exe
+    - sinon -> dossier du script courant
+    """
+    if os.getenv("CMX_BASE_DIR"):
+        return Path(os.getenv("CMX_BASE_DIR") or ".").resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.resolve()
+    return Path(__file__).parent.resolve()
+
+
+def _secrets_to_env() -> None:
+    """
+    Si streamlit.secrets existe, copie quelques clés vers os.environ.
+    Tolère l'absence de streamlit en EXE/CLI.
+    """
+    keys = ("GIT_PUBLIC_REPO", "GIT_TOKEN", "GIT_BRANCH", "GIT_AUTHOR", "ADMIN_KEY")
+    try:
+        if st and hasattr(st, "secrets"):
+            for k in keys:
+                try:
+                    v = str(st.secrets.get(k, "")).strip()
+                    if v:
+                        os.environ[k] = v
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+BASE = _app_base()
+_secrets_to_env()
+
+ARCHIVE   = BASE / "ARCHIVE"
+PDF_DIR   = BASE / "PDF_A_TRAITER"
+PDF_DONE  = ARCHIVE / "PDF_TRAITES"
+SNAP_DIR  = BASE / "SNAPSHOTS"
+DATA_DIR  = BASE / "data"           # snapshot public
+
+F_MASTER   = BASE / "GAINS_Wina.xlsx"  # facultatif (fallback local)
 RESULTS_LOG = ARCHIVE / "results_log.csv"
 JOURNAL_CSV = ARCHIVE / "journal.csv"
 
@@ -45,9 +75,40 @@ for d in (ARCHIVE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR):
 IS_PUBLIC = os.getenv("CMX_MODE", "local").lower() == "public"
 
 
-# ==============
-# Schémas (UNIFIÉS)
-# ==============
+def _normalize_repo_url(repo_url: str) -> str:
+    """
+    Accepte:
+      - 'https://github.com/owner/repo.git'
+      - 'https://github.com/owner/repo'
+      - 'github.com/owner/repo'
+      - 'owner/repo'
+    Et renvoie toujours une URL https complète, avec .git.
+    """
+    u = (repo_url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("https://") or u.startswith("http://"):
+        # Normalise le host github + force .git
+        if "github.com/" in u and not u.endswith(".git"):
+            u += ".git"
+        return u
+    if u.startswith("github.com/"):
+        v = u.split("github.com/", 1)[1]
+        if not v.endswith(".git"):
+            v += ".git"
+        return f"https://github.com/{v}"
+    # Format court: owner/repo(.git)
+    if re.match(r"^[\w.-]+/[\w.-]+(?:\.git)?$", u):
+        if not u.endswith(".git"):
+            u += ".git"
+        return f"https://github.com/{u}"
+    return u
+
+
+# =============================================================================
+# Schémas / argent / saison
+# =============================================================================
+
 RESULTS_LOG_COLUMNS = [
     "tournament_id", "tournament_name",
     "start_time", "processed_at",
@@ -57,12 +118,8 @@ RESULTS_LOG_COLUMNS = [
 ]
 JOURNAL_COLUMNS = ["sha1", "filename", "processed_at"]
 
-
-
-# ==============
-# Utilitaires argent / saison
-# ==============
 _money_re = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
 def parse_money(x) -> float:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return 0.0
@@ -70,7 +127,8 @@ def parse_money(x) -> float:
         return float(x)
     s = str(x)
     m = _money_re.search(s.replace(" ", ""))
-    if not m: return 0.0
+    if not m:
+        return 0.0
     return float(m.group(0).replace(",", "."))
 
 def euro(v: float) -> str:
@@ -80,171 +138,29 @@ def current_season_bounds(today: Optional[date] = None) -> tuple[date, date]:
     """Saison = 01/08 -> 31/07"""
     today = today or date.today()
     year = today.year
-    season_start = date(year if today >= date(year,8,1) else year-1, 8, 1)
-    season_end   = date(season_start.year+1, 7, 31)
-    return season_start, season_end
-
-def _github_upsert_files(repo: str, token: str, branch: str, files: dict[str, bytes], folder: str = "data") -> list[str]:
-    """
-    Crée/maj des fichiers dans un dépôt GitHub via l'API Contents.
-    files: {"nom.csv": b"...", ...}
-    Retourne la liste des chemins upsertés.
-    """
-    api = "https://api.github.com"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
-    touched = []
-    for name, blob in files.items():
-        path = f"{folder}/{name}"
-        # récupère le SHA s'il existe déjà
-        r = requests.get(f"{api}/repos/{repo}/contents/{path}?ref={branch}", headers=headers, timeout=30)
-        sha = r.json().get("sha") if r.status_code == 200 else None
-
-        payload = {
-            "message": f"CoronaMax: update {path}",
-            "content": base64.b64encode(blob).decode("ascii"),
-            "branch": branch,
-        }
-        if sha:
-            payload["sha"] = sha
-
-        r = requests.put(f"{api}/repos/{repo}/contents/{path}", headers=headers, json=payload, timeout=60)
-        if r.status_code not in (200, 201):
-            raise RuntimeError(f"Push GitHub échoué pour {path}: {r.status_code} {r.text}")
-        touched.append(path)
-    return touched
-
-def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
-    """Exécute une commande et renvoie (rc, log)."""
-    try:
-        p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, shell=False)
-        out = (p.stdout or "") + (p.stderr or "")
-        return p.returncode, out.strip()
-    except Exception as e:
-        return 1, f"EXC:{e}"
-
-def _authed_repo_url(repo: str, token: str) -> str:
-    # Evite caractères spéciaux dans le token
-    t = quote(token, safe="")
-    return f"https://x-access-token:{t}@github.com/{repo}.git"
-
-def _ensure_pub_repo(local_dir: Path, repo: str, token: str, branch: str) -> tuple[bool, str]:
-    """
-    Prépare le dépôt local .pubpush/repo :
-      - clone si besoin avec URL authentifiée
-      - sinon, s’assure que 'origin' pointe vers l’URL authentifiée
-      - checkout sur la branche voulue
-    """
-    logs = []
-    url = _authed_repo_url(repo, token)
-
-    local_dir.mkdir(parents=True, exist_ok=True)
-    git_dir = local_dir / ".git"
-
-    if not git_dir.exists():
-        # clone propre
-        rc, out = _run(["git", "clone", "--depth", "1", "--branch", branch, url, str(local_dir.name)], cwd=local_dir.parent)
-        logs.append(f"clone: rc={rc} {out}")
-        if rc != 0:
-            return False, "\n".join(logs)
-    else:
-        # s’assure que le remote a bien l’URL authentifiée
-        rc, _ = _run(["git", "remote", "set-url", "origin", url], cwd=local_dir)
-        logs.append(f"set-url: rc={rc}")
-        # fetch + checkout
-        rc, out = _run(["git", "fetch", "origin", branch], cwd=local_dir)
-        logs.append(f"fetch: rc={rc} {out}")
-        rc, out = _run(["git", "checkout", branch], cwd=local_dir)
-        logs.append(f"checkout: rc={rc} {out}")
-
-    # Config auteur (au cas où)
-    _run(["git", "config", "user.name", "CoronaMax Bot"], cwd=local_dir)
-    _run(["git", "config", "user.email", "bot@example.invalid"], cwd=local_dir)
-
-    return True, "\n".join(logs)
-
-def _git_push_all(local_dir: Path, repo: str, token: str, branch: str) -> tuple[bool, str]:
-    """
-    Ajoute/commit et pousse vers la branche (avec URL authentifiée explicite au push).
-    """
-    logs = []
-
-    # add
-    rc, out = _run(["git", "add", "-A"], cwd=local_dir)
-    logs.append(f"git add: rc={rc} {out}")
-    if rc != 0:
-        return False, "\n".join(logs)
-
-    # commit (peut renvoyer rc=1 si rien à committer — on tolère)
-    rc, out = _run(["git", "commit", "-m", "CoronaMax: snapshot public"], cwd=local_dir)
-    logs.append(f"git commit: rc={rc} {out}")
-
-    # push avec URL authentifiée *directement* pour être sûr que le token est pris en compte
-    url = _authed_repo_url(repo, token)
-    rc, out = _run(["git", "push", url, f"HEAD:{branch}"], cwd=local_dir)
-    logs.append(f"git push: rc={rc} {out}")
-
-    return (rc == 0), "\n".join(logs)
+    s0 = date(year if today >= date(year,8,1) else year-1, 8, 1)
+    s1 = date(s0.year+1, 7, 31)
+    return s0, s1
 
 
-def _build_public_snapshot_files() -> dict[str, bytes]:
-    """
-    Construit les blobs à publier dans data/ :
-      - results_log.csv, journal.csv, latest_master.csv, points_table.csv
-      - et les PDFs ARCHIVE/PDF_TRAITES copiés dans data/PDF_Traites/
-    """
-    log = load_results_log_any()
-    journal = load_journal_any()
-    try:
-        classement = standings_from_log(log, season_only=False)
-    except Exception:
-        classement = pd.DataFrame()
+# =============================================================================
+# Normalisation CSV & I/O
+# =============================================================================
 
-    # points sur toute la période dispo
-    if not log.empty:
-        d1 = log["start_time"].min().date()
-        d2 = log["start_time"].max().date()
-        points = compute_points_table(log, d1, d2)
-    else:
-        points = pd.DataFrame(columns=["Place","Pseudo","Parties","ITM","Victoires","Points"])
-
-    files: dict[str, bytes] = {}
-    files["results_log.csv"]   = _normalize_results_log(log).to_csv(index=False).encode("utf-8")
-    files["journal.csv"]       = _normalize_journal(journal).to_csv(index=False).encode("utf-8")
-    files["latest_master.csv"] = classement.to_csv(index=False).encode("utf-8")
-    files["points_table.csv"]  = points.to_csv(index=False).encode("utf-8")
-
-    # PDFs -> sous-dossier data/PDF_Traites
-    pdf_dir = DATA_DIR / "PDF_Traites"
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    for p in PDF_DONE.glob("*.pdf"):
-        # on injecte aussi leur contenu dans le dict avec un nom de type "PDF_Traites/nom.pdf"
-        files[f"PDF_Traites/{p.name}"] = p.read_bytes()
-
-    return files
-
-# ==============
-# Normalisation CSV (robuste aux variantes)
-# ==============
 def _normalize_results_log(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    # alias
     alias = {
         "GainCash": "GainsCash",
         "Recaves": "Reentry",
         "buyin": "buyin_total",
         "buyin_total_ttc": "buyin_total",
     }
-    d = d.rename(columns={k:v for k,v in alias.items() if k in d.columns})
+    d = d.rename(columns={k: v for k, v in alias.items() if k in d.columns})
 
-    # colonnes manquantes
     for c in RESULTS_LOG_COLUMNS:
         if c not in d.columns:
             d[c] = 0 if c in ("Position","GainsCash","Bounty","Reentry","buyin_total") else ""
 
-    # types
     d["start_time"]   = pd.to_datetime(d["start_time"], errors="coerce")
     d["processed_at"] = pd.to_datetime(d["processed_at"], errors="coerce")
     for c in ("Position","Reentry"):
@@ -258,76 +174,33 @@ def _normalize_results_log(df: pd.DataFrame) -> pd.DataFrame:
 def _normalize_journal(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     for c in JOURNAL_COLUMNS:
-        if c not in d.columns: d[c] = ""
+        if c not in d.columns:
+            d[c] = ""
     d["processed_at"] = pd.to_datetime(d["processed_at"], errors="coerce")
     return d[JOURNAL_COLUMNS]
 
 def safe_unlink(p: Path, retries: int = 5, delay: float = 0.2) -> None:
-    """Supprime un fichier en réessayant si Windows signale qu'il est occupé."""
     for _ in range(retries):
         try:
             p.unlink(missing_ok=True)
             return
         except PermissionError:
             time.sleep(delay)
-    # Dernier essai : on abandonne silencieusement (ou log si tu préfères)
     try:
         p.unlink(missing_ok=True)
     except Exception:
         pass
 
-# ==============
-# Loaders "any" (public ou local)
-# ==============
+
 def _choose_public_or_local(public_rel: str, local_path: Path) -> Path:
-    """En mode PUBLIC on lit data/<file>, sinon on lit toujours le local."""
-    if IS_PUBLIC:
-        pp = DATA_DIR / public_rel
-        return pp if pp.exists() else local_path
-    else:
-        return local_path
-
-
-def _try_read_csv_any(path: Path):
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            return pd.read_csv(path, encoding=enc)
-        except Exception:
-            continue
-    return None
+    pp = DATA_DIR / public_rel
+    return pp if pp.exists() else local_path
 
 def load_results_log_any() -> pd.DataFrame:
-    candidates = [
-        DATA_DIR / "results_log.csv",
-        BASE / "data" / "results_log.csv",
-        Path("data") / "results_log.csv",
-    ]
-    for p in candidates:
-        if p.exists() and p.stat().st_size > 0:
-            df = _try_read_csv_any(p)
-            if df is not None and not df.empty:
-                return _normalize_results_log(df)
-
-    # fallback local (ARCHIVE) si jamais
-    if RESULTS_LOG.exists() and RESULTS_LOG.stat().st_size > 0:
-        df = _try_read_csv_any(RESULTS_LOG)
-        if df is not None and not df.empty:
-            return _normalize_results_log(df)
-
-    return pd.DataFrame(columns=RESULTS_LOG_COLUMNS)
-
-def load_points_table_any() -> pd.DataFrame:
-    p = DATA_DIR / "points_table.csv"
-    if p.exists() and p.stat().st_size > 0:
-        try:
-            df = pd.read_csv(p, encoding="utf-8")
-        except Exception:
-            df = pd.read_csv(p, encoding="utf-8-sig")
-        # garde les colonnes attendues si présentes
-        want = ["Place", "Pseudo", "Parties", "ITM", "Victoires", "Points"]
-        keep = [c for c in want if c in df.columns]
-        return df[keep] if keep else df
-    return pd.DataFrame()
+    p = _choose_public_or_local("results_log.csv", RESULTS_LOG)
+    if not p.exists() or p.stat().st_size == 0:
+        return pd.DataFrame(columns=RESULTS_LOG_COLUMNS)
+    return _normalize_results_log(pd.read_csv(p))
 
 def load_journal_any() -> pd.DataFrame:
     p = _choose_public_or_local("journal.csv", JOURNAL_CSV)
@@ -342,48 +215,44 @@ def load_latest_master_any() -> pd.DataFrame:
         if "Buy_in" in df.columns and "Buy in" not in df.columns:
             df = df.rename(columns={"Buy_in":"Buy in"})
         return df
-    # fallback local vide
     return pd.DataFrame(columns=["Place","Pseudo","Parties","Victoires","ITM","% ITM",
                                  "Recaves","Recaves en €","Bulles","Buy in","Frais","Gains","Bénéfices"])
 
-# Loaders / Savers locaux
-def load_results_log() -> pd.DataFrame:
-    """Toujours le fichier local (utilisé par l’app de traitement)."""
-    p = RESULTS_LOG
+def load_journal() -> pd.DataFrame:
+    """
+    Charge ARCHIVE/journal.csv.
+    Si absent ou vide, renvoie un DataFrame vide avec le bon schéma.
+    """
+    p = JOURNAL_CSV
     if not p.exists() or p.stat().st_size == 0:
-        return pd.DataFrame(columns=RESULTS_LOG_COLUMNS)
-    return _normalize_results_log(pd.read_csv(p))
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        # fichier corrompu / encodage : repart sur un DF vide mais typé
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+    return _normalize_journal(df)
+
+
+def save_journal(df: pd.DataFrame) -> None:
+    _normalize_journal(df).to_csv(JOURNAL_CSV, index=False, encoding="utf-8")
 
 def append_results_log(df_rows: pd.DataFrame) -> None:
-    """Append rows to RESULTS_LOG (schéma normalisé)."""
     cur = load_results_log_any()
     add = _normalize_results_log(df_rows)
     out = pd.concat([cur, add], ignore_index=True)
     out.to_csv(RESULTS_LOG, index=False, encoding="utf-8")
 
-def load_journal() -> pd.DataFrame:
-    """Toujours le fichier local (utilisé par l’app de traitement)."""
-    p = JOURNAL_CSV
-    if not p.exists() or p.stat().st_size == 0:
-        return pd.DataFrame(columns=JOURNAL_COLUMNS)
-    return _normalize_journal(pd.read_csv(p))
-
-def save_journal(df: pd.DataFrame) -> None:
-    _normalize_journal(df).to_csv(JOURNAL_CSV, index=False, encoding="utf-8")
-
 def save_master_df(df: pd.DataFrame, path: Optional[Path] = None) -> None:
-    """Sauvegarde CSV pour snapshot interne (Excel facultatif chez toi)."""
     p = path or (DATA_DIR / "latest_master.csv")
     df.to_csv(p, index=False, encoding="utf-8")
 
-# ==============
-# Extractions PDF Winamax (regex robustes)
-# ==============
-HeaderRe = re.compile(
-    r"Tournoi de poker\s+(?P<name>.*?)\s+du\s+(?P<date>\d{2}[-/]\d{2}[-/]\d{4})\s+(?P<time>\d{1,2}[:h]\d{2})\s+en argent réel",
-    re.IGNORECASE | re.DOTALL
-)
-MoneyRe = re.compile(r"(\d+[.,]\d+|\d+)\s*€")
+
+# =============================================================================
+# Extraction PDF Winamax (robuste)
+# =============================================================================
 
 @dataclass
 class ParsedTournament:
@@ -391,77 +260,13 @@ class ParsedTournament:
     tournament_name: str
     start_time: datetime
     buyin_total: float
-    rows: pd.DataFrame  # colonnes: Pseudo, Position, GainsCash, Bounty, Reentry
-
-
-_WS = re.compile(r"[ \t\u00A0]+")  # espace normal + insécable
-
-def _norm(s: str) -> str:
-    s = s.replace("\u00A0", " ").replace("–", "-").replace("—", "-")
-    s = s.replace("\r", "\n")
-    s = re.sub(r"\n+", "\n", s)
-    s = _WS.sub(" ", s)
-    return s.strip()
-
-def _parse_dt(d: str, t: str) -> datetime:
-    # d: '31-08-2025' ; t: '21:15', '21h15' ou '2115'
-    d = d.replace("/", "-")
-    if re.fullmatch(r"\d{4}", t):
-        t = f"{t[:2]}:{t[2:]}"
-    t = t.replace("h", ":")
-    return datetime.strptime(f"{d} {t}", "%d-%m-%Y %H:%M")
-
-def _parse_header_from_text(text: str):
-    """
-    Retourne (name, datetime) en lisant le texte du PDF, sinon (None, None).
-    """
-    text = _norm(text)
-    patterns = [
-        r"tournoi de poker (?P<name>.+?) du (?P<date>\d{2}[-/]\d{2}[-/]\d{4}) (?P<time>\d{1,2}[:h]?\d{2}) en argent reel",
-        r"tournoi de poker (?P<name>.+?) du (?P<date>\d{2}[-/]\d{2}[-/]\d{4}) (?P<time>\d{1,2}[:h]?\d{2})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.I)
-        if m:
-            name = m.group("name").strip()
-            dt = _parse_dt(m.group("date"), m.group("time"))
-            name = re.sub(r"^winamax\.fr\s*-\s*", "", name, flags=re.I)
-            return name, dt
-    return None, None
-
-def _parse_header_from_filename(fname: str):
-    """
-    Secours: parse le nom de fichier si le texte PDF est foireux.
-    """
-    base = Path(fname).stem
-    s = _norm(base)
-    m = re.search(
-        r"(?P<name>tournoi de poker .+?) du (?P<date>\d{2}-\d{2}-\d{4}) (?P<time>(\d{2}:\d{2}|\d{4}|\d{2}h\d{2}))",
-        s, flags=re.I
-    )
-    if m:
-        name = m.group("name").strip()
-        dt = _parse_dt(m.group("date"), m.group("time"))
-        name = re.sub(r"^winamax\.fr\s*-\s*", "", name, flags=re.I)
-        return name, dt
-    return None, None
-
-def _extract_header(pdf_text: str, pdf_path: Path):
-    """
-    Renvoie (tournament_name, start_time) ou lève ValueError si introuvable.
-    """
-    name, dt = _parse_header_from_text(pdf_text)
-    if not name:
-        name, dt = _parse_header_from_filename(pdf_path.name)
-    if not name or not dt:
-        raise ValueError("En-tete tournoi introuvable (nom/date/heure).")
-    return name, dt
+    rows: pd.DataFrame  # Position, Pseudo, GainsCash, Bounty, Reentry
 
 
 def _pdf_text(p: Path) -> str:
-    # Lecture en mémoire pour éviter tout lock Windows
+    # 1) PyPDF2 (mémoire) ; fallback pdfminer
     try:
-        import PyPDF2, io
+        import PyPDF2
         data = p.read_bytes()
         reader = PyPDF2.PdfReader(io.BytesIO(data))
         parts = []
@@ -470,7 +275,6 @@ def _pdf_text(p: Path) -> str:
         return "\n".join(parts)
     except Exception:
         pass
-    # Fallback pdfminer (si installé)
     try:
         from pdfminer.high_level import extract_text
         return extract_text(str(p))
@@ -480,41 +284,26 @@ def _pdf_text(p: Path) -> str:
 
 def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
     """
-    Parse un PDF Winamax 'résultats de tournoi' :
-      - nom du tournoi + date/heure (gère plusieurs variantes d'en-tête)
-      - buy-in + rake  => buyin_total
-      - table Résultats : Position, Pseudo, GainsCash, Bounty (si KO), Reentry (recaves)
-    Retourne ParsedTournament(name, start_time, buyin_total, rows: DataFrame)
+    Parse un PDF 'résultats de tournoi' Winamax :
+      - nom + date/heure (plusieurs variantes)
+      - Buy-in + Rake => buyin_total
+      - table Résultats (Position, Pseudo, GainsCash, Bounty, Reentry)
     """
-    import re, hashlib
-    from datetime import datetime
-    import pandas as pd
-
     txt = _pdf_text(pdf_path)
 
-    # --- Normalisation douce (espaces insécables, tirets longs, etc.)
-    norm = txt.replace("\xa0", " ").replace("—", "-")
+    # Normalisation
+    norm = (txt or "").replace("\xa0", " ").replace("—", "-")
     norm = re.sub(r"[ \t]+", " ", norm)
 
-    # ---------- 1) En-tête = nom + date/heure ----------
-    # Cas A (classique) : "Tournoi de poker <NAME> du 07-09-2025 21:15 en argent réel"
+    # ---------- En-tête ----------
     patA = re.compile(
         r"Tournoi\s+de\s+poker\s+(?P<name>.+?)\s+du\s+"
         r"(?P<date>\d{2}[/-]\d{2}[/-]\d{4})\s+"
         r"(?P<time>\d{2}(?::|h)?\d{2})\s+en\s+argent\s+r[ée]el",
         flags=re.IGNORECASE | re.DOTALL,
     )
-
-    # Cas B (variantes récentes Winamax) :
-    # "... Tournoi de poker <NAME> Buy-in : 9,00 € Rake : 1,00 € ... Début du tournoi : - 07/09/2025 21:15"
-    patB_name = re.compile(
-        r"Tournoi\s+de\s+poker\s+(?P<name>.+?)\s+Buy-?in",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    patB_dt = re.compile(
-        r"Début\s+du\s+tournoi\s*:\s*-?\s*(?P<date>\d{2}[/-]\d{2}[/-]\d{4})\s+(?P<time>\d{2}(?::|h)?\d{2})",
-        flags=re.IGNORECASE,
-    )
+    patB_name = re.compile(r"Tournoi\s+de\s+poker\s+(?P<name>.+?)\s+Buy-?in", re.IGNORECASE|re.DOTALL)
+    patB_dt   = re.compile(r"Début\s+du\s+tournoi\s*:\s*-?\s*(?P<date>\d{2}[/-]\d{2}[/-]\d{4})\s+(?P<time>\d{2}(?::|h)?\d{2})", re.IGNORECASE)
 
     mA = patA.search(norm)
     if mA:
@@ -530,12 +319,11 @@ def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
         dstr = mD.group("date").replace("/", "-")
         tstr = mD.group("time").replace("h", ":")
 
-    # Gérer l’heure écrite "2115" (sans séparateur)
     if re.fullmatch(r"\d{4}", tstr):
         tstr = f"{tstr[:2]}:{tstr[2:]}"
     start = datetime.strptime(f"{dstr} {tstr}", "%d-%m-%Y %H:%M")
 
-    # ---------- 2) Buy-in + Rake ----------
+    # ---------- Buy-in + Rake ----------
     buy_rake_re = re.compile(
         r"Buy-?in\s*:\s*(?P<bi>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€"
         r".{0,120}?Rake\s*:\s*(?P<rk>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€",
@@ -547,7 +335,6 @@ def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
         rk = parse_money(mbr.group("rk") + " €")
         buyin_total = float(bi + rk)
     else:
-        # Fallback : on cherche vers "Buy-in" deux montants €
         buyin_total = 0.0
         try:
             i = norm.lower().index("buy-in")
@@ -559,13 +346,12 @@ def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
         except Exception:
             pass
         if buyin_total <= 0:
-            buyin_total = 10.0  # défaut raisonnable si introuvable
+            buyin_total = 10.0
 
-    # ---------- 3) Bloc Résultats ----------
-    # On repart du texte original (retours ligne utiles pour repérer les lignes)
-    lines = [L.strip() for L in txt.splitlines() if L.strip()]
+    # ---------- Résultats ----------
+    lines = [L.strip() for L in (txt or "").splitlines() if L.strip()]
 
-    # On coupe après "Résultats"
+    # couper après "Résultats"
     start_idx = 0
     for i, L in enumerate(lines):
         if "Résultats" in L or "Resultats" in L:
@@ -573,33 +359,26 @@ def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
             break
     lines = lines[start_idx:]
 
-    # Helpers regex
     money_pat = re.compile(r"(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€")
-    head_int = re.compile(r"^\s*(\d+)\b")
-    tail_int = re.compile(r"(\d+)\s*$")
+    head_int  = re.compile(r"^\s*(\d+)\b")
+    tail_int  = re.compile(r"(\d+)\s*$")
     reentry_inline = re.compile(r"Re-?entry\s*:?[\s=]*(\d+)", re.IGNORECASE)
 
-    def parse_result_line(L: str):
+    def parse_line(L: str):
         mpos = head_int.search(L)
         if not mpos:
             return None
         pos = int(mpos.group(1))
         rest = L[mpos.end():].strip()
 
-        # Tous les montants de la ligne
         monies = list(money_pat.finditer(rest))
         if not monies:
             return None
 
         gains_span = monies[0].span()
-        gains_val = parse_money(monies[0].group(1) + " €")
+        gains_val  = parse_money(monies[0].group(1) + " €")
+        bounty_val = parse_money(monies[1].group(1) + " €") if len(monies) >= 2 else 0.0
 
-        bounty_val = 0.0
-        if len(monies) >= 2:
-            # Si KO, il y a un 2e montant qui correspond au bounty
-            bounty_val = parse_money(monies[1].group(1) + " €")
-
-        # Reentry : priorité à "Re-entry : <n>", sinon entier final
         m_inline = reentry_inline.search(rest)
         if m_inline:
             reentry_val = int(m_inline.group(1))
@@ -627,19 +406,18 @@ def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
 
     rows = []
     for L in lines:
-        r = parse_result_line(L)
+        r = parse_line(L)
         if r:
             rows.append(r)
 
-    df_rows = pd.DataFrame(rows, columns=["Position", "Pseudo", "GainsCash", "Bounty", "Reentry"])
+    df_rows = pd.DataFrame(rows, columns=["Position","Pseudo","GainsCash","Bounty","Reentry"])
     if df_rows.empty:
         raise RuntimeError("0 ligne détectée dans la table 'Résultats'.")
     df_rows = df_rows.sort_values("Position", kind="mergesort").reset_index(drop=True)
 
-    # ---------- 4) ID de tournoi déterministe ----------
+    # ---------- ID déterministe ----------
     try:
-        sha_src = (pdf_path.read_bytes() if pdf_path.exists() else b"") + \
-                  (name + start.isoformat()).encode("utf-8")
+        sha_src = (pdf_path.read_bytes() if pdf_path.exists() else b"") + (name + start.isoformat()).encode("utf-8")
     except Exception:
         sha_src = (name + start.isoformat() + str(pdf_path)).encode("utf-8")
     sha = hashlib.sha1(sha_src).hexdigest()
@@ -653,11 +431,6 @@ def extract_from_pdf(pdf_path: Path) -> ParsedTournament:
     )
 
 
-
-
-# ==============
-# Construction lignes log
-# ==============
 def build_rows_for_log(parsed: ParsedTournament) -> pd.DataFrame:
     d = parsed.rows.copy()
     d["tournament_id"]   = parsed.tournament_id
@@ -665,44 +438,25 @@ def build_rows_for_log(parsed: ParsedTournament) -> pd.DataFrame:
     d["start_time"]      = parsed.start_time
     d["processed_at"]    = datetime.now()
     d["buyin_total"]     = parsed.buyin_total
-    # ordre normalisé
     d = d[["tournament_id","tournament_name","start_time","processed_at",
            "Pseudo","Position","GainsCash","Bounty","Reentry","buyin_total"]]
     return _normalize_results_log(d)
 
-# ==============
+
+# =============================================================================
 # Agrégations
-# ==============
-def _order_master_with_winamax_first(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    if "Pseudo" in d.columns:
-        is_w = d["Pseudo"].str.lower().eq("winamax")
-        top = d[is_w]
-        rest = d[~is_w]
-        # tri par bénéfices
-        if "Bénéfices" in rest.columns:
-            rest = rest.sort_values("Bénéfices", ascending=False)
-        d = pd.concat([top, rest], ignore_index=True)
-        d.insert(0, "Place", range(len(d)))
-    return d
+# =============================================================================
 
 def standings_from_log(log: pd.DataFrame, season_only: bool = False) -> pd.DataFrame:
     """
-    Construit le classement "gains" à partir du RESULTS_LOG.
-    Colonnes attendues (robustes) dans `log` :
-      - tournament_id, Pseudo, Position, GainsCash, Bounty, Reentry, buyin_total, start_time
-
-    Règles :
-      - ITM = nb de lignes avec GainsCash > 0 (bounty ignoré)
-      - Bulles = par tournoi, 1er joueur (plus petite Position) avec GainsCash <= 0
-      - Frais = Buy-in (1 par tournoi et par joueur) + Recaves * buyin_total
-      - Gains = GainsCash + Bounty
-      - Bénéfices = Gains - Frais
-      - Winamax = 10% des Frais de tous les autres, Parties = nb de tournois
+    Classement “gains” :
+      ITM = GainsCash > 0
+      Bulles = par tournoi, 1er joueur non payé
+      Frais = buyin_total * (1 + Reentry)
+      Gains = GainsCash + Bounty
+      Bénéfices = Gains - Frais
+      Winamax = 10% des frais de tous les autres ; Parties = nb tournois
     """
-    import numpy as np
-
-    # Colonnes de sortie “propres”
     OUT_COLS = ["Place","Pseudo","Parties","Victoires","ITM","% ITM",
                 "Recaves","Recaves en €","Bulles","Buy in","Frais",
                 "Gains","Bénéfices"]
@@ -712,14 +466,12 @@ def standings_from_log(log: pd.DataFrame, season_only: bool = False) -> pd.DataF
 
     df = log.copy()
 
-    # --- helpers robustes
     def _pick_series(d: pd.DataFrame, candidates: list[str], default):
         for c in candidates:
             if c in d.columns:
                 return d[c]
         return pd.Series([default] * len(d), index=d.index)
 
-    # conversions de base
     pseudo   = _pick_series(df, ["Pseudo"], "").astype(str)
     pos      = pd.to_numeric(_pick_series(df, ["Position","Place","Rank"], 0), errors="coerce").fillna(0).astype(int)
     gcash    = _pick_series(df, ["GainsCash","GainCash"], 0.0).apply(parse_money).fillna(0.0)
@@ -729,14 +481,12 @@ def standings_from_log(log: pd.DataFrame, season_only: bool = False) -> pd.DataF
     tid      = _pick_series(df, ["tournament_id"], "").astype(str)
     stime    = pd.to_datetime(_pick_series(df, ["start_time"], pd.NaT), errors="coerce")
 
-    # Filtre saison si demandé
     if season_only and not stime.isna().all():
         s0, s1 = current_season_bounds()
         m = (stime.dt.date >= s0) & (stime.dt.date <= s1)
         pseudo, pos, gcash, bounty, reentry, buyin_t, tid = \
             pseudo[m], pos[m], gcash[m], bounty[m], reentry[m], buyin_t[m], tid[m]
 
-    # Table de travail
     work = pd.DataFrame({
         "Pseudo": pseudo,
         "Position": pos,
@@ -750,7 +500,7 @@ def standings_from_log(log: pd.DataFrame, season_only: bool = False) -> pd.DataF
     if work.empty:
         return pd.DataFrame(columns=OUT_COLS)
 
-    # ---- Bulles : par tournoi, 1er sans cash
+    # Bulles
     bubbles_list = []
     for t, grp in work.groupby("tournament_id"):
         g = grp.sort_values("Position")
@@ -759,73 +509,48 @@ def standings_from_log(log: pd.DataFrame, season_only: bool = False) -> pd.DataF
             bubbles_list.append(no_paid.iloc[0]["Pseudo"])
     bulles_count = pd.Series(bubbles_list).value_counts() if bubbles_list else pd.Series(dtype=int)
 
-    # ---- Agrégats de base par joueur
     agg = work.groupby("Pseudo", as_index=False).agg(
         Parties   = ("Pseudo", "count"),
         Victoires = ("Position", lambda s: int((s == 1).sum())),
         ITM       = ("GainsCash", lambda s: int((s > 0).sum())),
         Recaves   = ("Reentry", "sum"),
-        Buy_in    = ("buyin_total", "sum"),  # 1 buy-in par tournoi et par joueur
+        Buy_in    = ("buyin_total", "sum"),
     )
 
-    # Recaves en € = somme(Reentry * buyin_total)
-    recaves_e = work.assign(reu=work["Reentry"] * work["buyin_total"]) \
-                    .groupby("Pseudo")["reu"].sum()
+    recaves_e = work.assign(reu=work["Reentry"] * work["buyin_total"]).groupby("Pseudo")["reu"].sum()
     agg["Recaves en €"] = agg["Pseudo"].map(recaves_e).fillna(0.0)
 
-    # Gains = GainsCash + Bounty
-    gains_tot = work.assign(gt=work["GainsCash"] + work["Bounty"]) \
-                    .groupby("Pseudo")["gt"].sum()
+    gains_tot = work.assign(gt=work["GainsCash"] + work["Bounty"]).groupby("Pseudo")["gt"].sum()
     agg["Gains"] = agg["Pseudo"].map(gains_tot).fillna(0.0)
 
-    # Frais & Bénéfices
     agg["Frais"] = agg["Buy_in"].fillna(0.0) + agg["Recaves en €"].fillna(0.0)
     agg["Bénéfices"] = agg["Gains"].fillna(0.0) - agg["Frais"].fillna(0.0)
-
-    # Bulles mappées
     agg["Bulles"] = agg["Pseudo"].map(bulles_count).fillna(0).astype(int)
+    agg["% ITM"] = agg.apply(lambda r: f"{int(round(100 * r['ITM'] / r['Parties']))}%" if r["Parties"] else "0%", axis=1)
 
-    # % ITM
-    agg["% ITM"] = agg.apply(
-        lambda r: f"{int(round(100 * r['ITM'] / r['Parties']))}%"
-        if r["Parties"] else "0%",
-        axis=1
-    )
-
-    # Renommage/ordre
     agg = agg.rename(columns={"Buy_in": "Buy in"})
     agg = agg[["Pseudo","Parties","Victoires","ITM","% ITM","Recaves","Recaves en €",
                "Bulles","Buy in","Frais","Gains","Bénéfices"]]
 
-    # ---- Ajout WINAMAX
     total_frais_autres = float(agg["Frais"].sum())
     n_tourneys = work["tournament_id"].nunique()
     wina = pd.DataFrame([{
         "Pseudo": "WINAMAX",
         "Parties": int(n_tourneys),
-        "Victoires": 0,
-        "ITM": 0,
-        "% ITM": "0%",
-        "Recaves": 0,
-        "Recaves en €": 0.0,
-        "Bulles": 0,
-        "Buy in": 0.0,
-        "Frais": 0.0,
+        "Victoires": 0, "ITM": 0, "% ITM": "0%",
+        "Recaves": 0, "Recaves en €": 0.0, "Bulles": 0,
+        "Buy in": 0.0, "Frais": 0.0,
         "Gains": round(total_frais_autres * 0.10, 2),
         "Bénéfices": round(total_frais_autres * 0.10, 2),
     }])
 
     out = pd.concat([wina, agg[agg["Pseudo"].str.lower() != "winamax"]], ignore_index=True)
-
-    # Tri : Winamax en haut, puis bénéfices décroissants
     others = out[out["Pseudo"].str.lower() != "winamax"].sort_values("Bénéfices", ascending=False)
     out = pd.concat([out[out["Pseudo"].str.lower() == "winamax"], others], ignore_index=True)
 
-    # Place (Winamax = 0, joueurs = 1..N)
     places = [0] + list(range(1, len(out)))
     out.insert(0, "Place", places)
 
-    # Types propres
     for c in ["Parties","Victoires","ITM","Recaves","Bulles","Place"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
@@ -850,14 +575,13 @@ def compute_points_table(log: pd.DataFrame, d1: date, d2: date) -> pd.DataFrame:
     vic    = (g["Position"] == 1).astype(int)
 
     tmp = pd.DataFrame({"Pseudo":g["Pseudo"],"Points":points,"ITM":itm,"Victoires":vic,"Parties":1})
-    tmp = tmp[~tmp["Pseudo"].str.lower().eq("winamax")]  # pas de Winamax ici
+    tmp = tmp[~tmp["Pseudo"].str.lower().eq("winamax")]
     agg = tmp.groupby("Pseudo", as_index=False).sum(numeric_only=True)
     agg = agg.sort_values(["Points","Victoires","ITM","Parties"], ascending=[False,False,False,False])
     agg.insert(0, "Place", range(1, len(agg)+1))
     return agg[["Place","Pseudo","Parties","ITM","Victoires","Points"]]
 
 
-# --- Utilitaire: bulle à partir d’un DF (Positions / GainCash) ---
 def compute_bubble_from_rows(df_rows: pd.DataFrame) -> str | None:
     if df_rows is None or len(df_rows) == 0:
         return None
@@ -878,128 +602,82 @@ def compute_bubble_from_rows(df_rows: pd.DataFrame) -> str | None:
     return None if no_paid.empty else str(no_paid.iloc[0]["Pseudo"])
 
 def _player_stats_from_log(log: pd.DataFrame, who: str) -> dict:
-    sub = log[log["Pseudo"].astype(str) == who].copy()
+    """
+    Statistiques d'un joueur 'who' sur le DataFrame 'log' (déjà filtré si besoin).
+    Correction bulle: on calcule la bulle par tournoi sur le log COMPLET,
+    puis on compte uniquement ceux où le pseudo bulle == who.
+    """
+    if log is None or log.empty:
+        return {}
+
+    # Normalisation robuste
+    g = _normalize_results_log(log).copy()
+    g["Position"]    = pd.to_numeric(g["Position"], errors="coerce").fillna(0).astype(int)
+    g["GainsCash"]   = pd.to_numeric(g["GainsCash"], errors="coerce").fillna(0.0)
+    g["Bounty"]      = pd.to_numeric(g.get("Bounty", 0.0), errors="coerce").fillna(0.0)
+    g["buyin_total"] = pd.to_numeric(g.get("buyin_total", 0.0), errors="coerce").fillna(0.0)
+    g["Reentry"]     = pd.to_numeric(g.get("Reentry", 0), errors="coerce").fillna(0).astype(int)
+    g["Pseudo"]      = g["Pseudo"].astype(str)
+    who = str(who)
+
+    # Sous-ensemble du joueur (pour le reste des stats)
+    sub = g[g["Pseudo"] == who].copy()
     if sub.empty:
         return {}
 
-    sub["Position"]   = pd.to_numeric(sub["Position"], errors="coerce").fillna(0).astype(int)
-    sub["GainsCash"]  = pd.to_numeric(sub.get("GainsCash", 0.0).apply(parse_money), errors="coerce").fillna(0.0)
-    sub["Bounty"]     = pd.to_numeric(sub.get("Bounty", 0.0).apply(parse_money), errors="coerce").fillna(0.0)
-    sub["buyin_total"]= pd.to_numeric(sub.get("buyin_total", 0.0), errors="coerce").fillna(0.0)
-    sub["Reentry"]    = pd.to_numeric(sub.get("Reentry", 0), errors="coerce").fillna(0).astype(int)
+    # --- Bulles: par tournoi = 1er joueur (position la plus haute) avec GainsCash <= 0
+    bubbles_by_tid = {}
+    for tid, grp in g.groupby("tournament_id"):
+        grp = grp.sort_values("Position")
+        no_paid = grp[grp["GainsCash"] <= 0.0]
+        if not no_paid.empty:
+            bubbles_by_tid[str(tid)] = str(no_paid.iloc[0]["Pseudo"])
+    player_tids = set(sub["tournament_id"].astype(str))
+    bubbles = sum(1 for tid in player_tids if bubbles_by_tid.get(tid) == who)
 
-    n = len(sub)
-    wins = int((sub["Position"] == 1).sum())
-    itm  = int((sub["GainsCash"] > 0.0).sum())
-    bubbles = 0
-    # bulles: “premier non payé” par tournoi (gainscash==0 & position==min_position_non_payé)
-    for tid, g in sub.groupby("tournament_id"):
-        g = g.sort_values("Position")
-        first_no_cash = g[g["GainsCash"] <= 0.0]
-        if not first_no_cash.empty and first_no_cash.iloc[0]["Pseudo"] == who:
-            bubbles += 1
-
-    last_pos = int(sub["Position"].max()) if n else 0
-    last_place = int((sub["Position"] == last_pos).sum()) if last_pos else 0
-
-    fees = (sub["buyin_total"] * (1 + sub["Reentry"])).sum()
-    gains = (sub["GainsCash"] + sub["Bounty"]).sum()
-    roi = (gains - fees) / fees if fees > 0 else 0.0
+    # --- Agrégats classiques
+    n     = int(len(sub))
+    wins  = int((sub["Position"] == 1).sum())
+    itm   = int((sub["GainsCash"] > 0.0).sum())
+    fees  = float((sub["buyin_total"] * (1 + sub["Reentry"])).sum())
+    gains = float((sub["GainsCash"] + sub["Bounty"]).sum())
+    benef = gains - fees
+    roi   = (benef / fees) if fees > 0 else 0.0
+    avgpos = float(sub["Position"].mean()) if n else 0.0
 
     return {
-        "n": n, "wins": wins, "itm": itm, "itm_rate": (itm/n if n else 0.0),
-        "bubbles": bubbles, "last_place": last_place,
-        "avg_pos": float(sub["Position"].mean()) if n else 0.0,
-        "fees": fees, "gains": gains, "benef": gains - fees, "roi": roi,
-        "table": sub.sort_values("start_time")
+        "n": n,
+        "wins": wins,
+        "itm": itm,
+        "itm_rate": (itm / n if n else 0.0),
+        "bubbles": int(bubbles),
+        "avg_pos": avgpos,
+        "fees": fees,
+        "gains": gains,
+        "benef": benef,
+        "roi": roi,                 # ROI sur gains totaux (cash + bounty), inchangé
+        "table": sub.sort_values("start_time"),
     }
 
 
-def render_player_details(log: pd.DataFrame):
-    if log.empty:
-        st.info("Aucun historique pour l’instant.")
-        return
 
-    who = st.selectbox("Choisir un joueur", sorted(log["Pseudo"].astype(str).unique().tolist()))
-    Z = _player_stats_from_log(log, who)
-    if not Z:
-        st.info("Pas de données pour ce joueur.")
-        return
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Parties", Z["n"])
-    c2.metric("Victoires", Z["wins"])
-    c3.metric("ITM", f"{Z['itm']} ({int(round(Z['itm_rate']*100))}%)")
-    c4.metric("Bulles", Z["bubbles"])
-    c5.metric("Dernières places", Z["last_place"])
-    c6.metric("Position moy.", f"{Z['avg_pos']:.2f}")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Frais", euro(Z["fees"]))
-    c2.metric("Gains", euro(Z["gains"]))
-    c3.metric("Bénéfices", euro(Z["benef"]))
-
-    # courbe cumulé frais/gains/bénéfices
-    sub = Z["table"].copy()
-    sub["Frais"] = sub["buyin_total"] * (1 + sub["Reentry"])
-    sub["GainsTot"] = sub["GainsCash"] + sub["Bounty"]
-    sub["Bénéfices"] = sub["GainsTot"] - sub["Frais"]
-    sub = sub.sort_values("start_time")
-
-    import altair as alt
-    series = sub[["start_time","Frais","GainsTot","Bénéfices"]].rename(columns={"start_time":"Date"})
-    st.altair_chart(
-        alt.Chart(series.melt("Date", var_name="Type", value_name="Valeur"))
-        .mark_line(point=True)
-        .encode(x="Date:T", y="Valeur:Q", color="Type:N")
-        .properties(height=320),
-        use_container_width=True
-    )
-
-    # répartition des positions
-    pos_count = sub["Position"].value_counts().sort_index().reset_index()
-    pos_count.columns = ["Position","Count"]
-    st.altair_chart(
-        alt.Chart(pos_count).mark_bar().encode(x="Position:O", y="Count:Q").properties(height=200),
-        use_container_width=True
-    )
-
-    # tableau détaillé (lisible)
-    show = sub[["start_time","tournament_name","Position","Reentry","buyin_total","Frais","GainsCash","Bounty","GainsTot","Bénéfices"]].copy()
-    for c in ["buyin_total","Frais","GainsCash","Bounty","GainsTot","Bénéfices"]:
-        show[c] = show[c].apply(euro)
-    show = show.rename(columns={"start_time":"Date","tournament_name":"Tournoi"})
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-
-# ==============
+# =============================================================================
 # Exports JPG (classement)
-# ==============
-def classement_df_to_jpg(df: pd.DataFrame, out_path: Path, dpi: int = 220):
-    """
-    Rend un JPG propre du classement :
-    - en-têtes gris
-    - Pseudo: WINAMAX rouge/blanc League Gothic, autres orange/noir
-    - Dégradé fort sur Bénéfices
-    - Bordures noires
-    """
-    import matplotlib.pyplot as plt
+# =============================================================================
+
+def _hsl_to_rgb_tuple(h: float, s: float, l: float):
     import colorsys
-    import numpy as np
+    r, g, b = colorsys.hls_to_rgb(h/360.0, l/100.0, s/100.0)
+    return float(r), float(g), float(b)
 
-    # --- util: HSL (CSS) -> RGB (0..1) pour matplotlib
-    def hsl_to_rgb_tuple(h_deg: float, s_pct: float, l_pct: float):
-        # colorsys prend H,L,S normalisés; CSS c'est H,S,L
-        r, g, b = colorsys.hls_to_rgb(h_deg / 360.0, l_pct / 100.0, s_pct / 100.0)
-        return (float(r), float(g), float(b))  # matplotlib accepte (r,g,b) floats
+def classement_df_to_jpg(df: pd.DataFrame, out_path: Path, dpi: int = 220, title: Optional[str] = None):
+    import matplotlib.pyplot as plt
 
-    # Colonnes dans l'ordre attendu si elles existent
     cols = ["Place","Pseudo","Parties","Victoires","ITM","% ITM","Recaves","Recaves en €",
             "Bulles","Buy in","Frais","Gains","Bénéfices"]
     cols = [c for c in cols if c in df.columns]
     data = df[cols].copy()
 
-    # Valeurs affichées
     def _fmt_money(x): return euro(parse_money(x))
     def _fmt_pct(x):
         try:
@@ -1015,25 +693,22 @@ def classement_df_to_jpg(df: pd.DataFrame, out_path: Path, dpi: int = 220):
         if c in shown.columns:
             shown[c] = shown[c].apply(_fmt_money)
 
-    # Styles cellule par cellule
     nrows, ncols = shown.shape
     cell_colours = [["#ffffff"] * ncols for _ in range(nrows)]
     text_colors  = [["#000000"] * ncols for _ in range(nrows)]
 
-    # Dégradé Bénéfices (HSL -> RGB)
     if "Bénéfices" in data.columns:
         vals = pd.to_numeric(data["Bénéfices"].apply(parse_money), errors="coerce").fillna(0.0)
         vmin, vmax = float(vals.min()), float(vals.max())
         span = (vmax - vmin) or 1.0
         j = shown.columns.get_loc("Bénéfices")
         for i, v in enumerate(vals):
-            t = (float(v) - vmin) / span  # 0..1
-            hue = 120.0 * t               # 0 rouge -> 120 vert
-            rgb = hsl_to_rgb_tuple(hue, 80.0, 78.0)
+            t = (float(v) - vmin) / span
+            hue = 120.0 * t
+            rgb = _hsl_to_rgb_tuple(hue, 80.0, 78.0)
             cell_colours[i][j] = rgb
             text_colors[i][j]  = "#000000"
 
-    # Pseudo : Winamax & co
     if "Pseudo" in shown.columns:
         j = shown.columns.get_loc("Pseudo")
         for i, name in enumerate(shown["Pseudo"].astype(str)):
@@ -1045,12 +720,15 @@ def classement_df_to_jpg(df: pd.DataFrame, out_path: Path, dpi: int = 220):
                 cell_colours[i][j] = "#f7b329"
                 text_colors[i][j]  = "#000000"
 
-    # Figure
     base_row_h = 0.4
     fig_h = max(3.0, base_row_h * (nrows + 2))
     fig_w = 1.1 + 0.95 * ncols
+
+    import matplotlib
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
     ax.axis("off")
+    if title:
+        ax.set_title(title, fontsize=16, fontweight="bold", pad=14)
 
     header_color = "#e6e6e6"
     header_text  = "#000000"
@@ -1065,7 +743,6 @@ def classement_df_to_jpg(df: pd.DataFrame, out_path: Path, dpi: int = 220):
         loc="center"
     )
 
-    # Bordures + styles
     for (r, c), cell in the_table.get_celld().items():
         cell.set_edgecolor("#222")
         cell.set_linewidth(1.0)
@@ -1073,98 +750,63 @@ def classement_df_to_jpg(df: pd.DataFrame, out_path: Path, dpi: int = 220):
             cell.set_text_props(color=header_text, weight="bold")
         else:
             cell.get_text().set_color(text_colors[r-1][c])
-            if shown.columns[c] == "Pseudo" and str(shown.iloc[r-1, c]).upper() == "WINAMAX":
-                cell.get_text().set_fontfamily("League Gothic")
-                cell.get_text().set_fontweight("heavy")
 
-    # Pointillés SOUS Winamax (une seule ligne horizontale, pas tous les bords)
     try:
-        # r = index de la ligne Winamax dans la table matplotlib (0 = en-tête)
         w_idx = data.index[data["Pseudo"].str.lower() == "winamax"][0]
-        r = w_idx + 1  # +1 car la ligne 0 est l'en-tête
-
-        # Coordonnées des cellules extrêmes de cette ligne (en unités d'axes)
+        r = w_idx + 1
         left_cell  = the_table[(r, 0)]
         right_cell = the_table[(r, ncols - 1)]
-        x0, y0 = left_cell.xy                      # bas-gauche de la cellule de gauche
-        x1 = right_cell.xy[0] + right_cell.get_width()  # bord droit de la cellule droite
-        y  = y0  # bord inférieur de la ligne Winamax
-
-        # Trace une ligne horizontale en pointillés SOUS la ligne Winamax
-        ax.add_line(plt.Line2D(
-            [x0, x1], [y, y],
-            transform=ax.transAxes,
-            linestyle=(0, (6, 4)),
-            color="#222",
-            linewidth=2.0
-        ))
+        x0, y0 = left_cell.xy
+        x1 = right_cell.xy[0] + right_cell.get_width()
+        y  = y0
+        ax.add_line(plt.Line2D([x0, x1], [y, y], transform=ax.transAxes,
+                               linestyle=(0, (6, 4)), color="#222", linewidth=2.0))
     except Exception:
         pass
 
-
-    plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, format="jpg", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
+
 def classement_points_df_to_jpg(df: pd.DataFrame, out_path: Path) -> None:
-    """
-    Rend un JPG du tableau 'classement par points'.
-    - largeur/hauteur calculées dynamiquement pour éviter tout rognage,
-    - fond orange sur la colonne 'Pseudo',
-    - en-têtes gris, bordures foncées.
-    """
     import matplotlib.pyplot as plt
-    import numpy as np
 
-    if not isinstance(out_path, Path):
-        out_path = Path(out_path)
-
-    # Sécurise l'ordre des colonnes si possible
     wanted = ["Place", "Pseudo", "Parties", "ITM", "Victoires", "Points"]
     cols = [c for c in wanted if c in df.columns] or df.columns.tolist()
     d = df[cols].copy()
 
-    # --------- Dimensions auto ----------
     n_rows, n_cols = d.shape
-    # largeur de base par colonne (un peu plus large pour 'Pseudo')
     base_w = 1.8
     extra = 1.2 if "Pseudo" in d.columns else 0.0
-    fig_w = max(14.0, base_w * n_cols + extra)        # >= 14 pouces
-    row_h = 0.62                                      # hauteur par ligne
+    fig_w = max(14.0, base_w * n_cols + extra)
+    row_h = 0.62
     head_h = 0.85
-    fig_h = max(5.0, head_h + row_h * (n_rows))       # >= 5 pouces
+    fig_h = max(5.0, head_h + row_h * (n_rows))
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=220)
     ax.axis("off")
 
-    # Convertit en str (pour éviter les accents/format age bizarres)
     data = d.astype(str).values.tolist()
     headers = [str(c) for c in d.columns.tolist()]
 
-    # Table
-    tbl = ax.table(cellText=data, colLabels=headers, cellLoc="center",
-                   loc="upper left")
+    tbl = ax.table(cellText=data, colLabels=headers, cellLoc="center", loc="upper left")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(12)
-    # Augmente la hauteur des lignes (évite la densité trop forte)
     tbl.scale(1, 1.35)
 
-    # Largeurs automatiques (toutes colonnes)
     try:
         tbl.auto_set_column_width(list(range(n_cols)))
     except Exception:
         pass
 
-    # Styles en-têtes
     for j in range(n_cols):
-        cell = tbl[0, j]  # ligne d'en-tête = 0
+        cell = tbl[0, j]
         cell.set_facecolor("#e6e6e6")
         cell.set_edgecolor("#222222")
         cell.set_linewidth(1.2)
         cell.set_text_props(weight="bold", color="#000000")
 
-    # Styles cellules + fonds de la colonne Pseudo
     for i in range(1, n_rows + 1):
         for j in range(n_cols):
             cell = tbl[i, j]
@@ -1174,14 +816,15 @@ def classement_points_df_to_jpg(df: pd.DataFrame, out_path: Path) -> None:
                 cell.set_facecolor("#f7b329")
                 cell.set_text_props(color="#000000", weight="bold")
 
-    # Sauvegarde sans rognage
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, bbox_inches="tight", pad_inches=0.5)
     plt.close(fig)
 
-# ==============
+
+# =============================================================================
 # Archive PDF & rollback
-# ==============
+# =============================================================================
+
 def archive_pdf(src: Path) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = PDF_DONE / f"{src.stem}__{ts}.pdf"
@@ -1190,21 +833,18 @@ def archive_pdf(src: Path) -> Path:
     return dest
 
 def rollback_last_import() -> dict:
-    """Supprime les dernières lignes du log (dernier tournoi) et remet le PDF en entrée si possible."""
     log = load_results_log_any()
     if log.empty:
         return {"ok": False, "msg": "Log vide."}
-    # dernier tournoi par processed_at
     last_ts = log["processed_at"].max()
     last_ids = log.loc[log["processed_at"] == last_ts, "tournament_id"].unique().tolist()
     if not last_ids:
         return {"ok": False, "msg": "Aucun import récent."}
     last_id = last_ids[-1]
-    # supprime ces lignes
+
     log2 = log[log["tournament_id"] != last_id].copy()
     log2.to_csv(RESULTS_LOG, index=False, encoding="utf-8")
 
-    # tente de retrouver le PDF archivé le plus récent
     back_pdf = ""
     pdfs = sorted(PDF_DONE.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
     if pdfs:
@@ -1214,175 +854,181 @@ def rollback_last_import() -> dict:
         back_pdf = dst.name
     return {"ok": True, "msg": "Dernier import annulé.", "pdf_back": back_pdf}
 
-# ==============
-# Snapshot public (écrit dans data/)
-# ==============
+
+# =============================================================================
+# Publication snapshot (local + push Git)
+# =============================================================================
+
+def _build_public_snapshot_files() -> dict[str, bytes]:
+    log = load_results_log_any()
+    journal = load_journal_any()
+
+    try:
+        classement = standings_from_log(log, season_only=False)
+    except Exception:
+        classement = pd.DataFrame()
+
+    if not log.empty:
+        d1 = log["start_time"].min().date()
+        d2 = log["start_time"].max().date()
+        points = compute_points_table(log, d1, d2)
+    else:
+        points = pd.DataFrame(columns=["Place","Pseudo","Parties","ITM","Victoires","Points"])
+
+    files: dict[str, bytes] = {}
+    files["results_log.csv"]  = _normalize_results_log(log).to_csv(index=False).encode("utf-8")
+    files["journal.csv"]      = _normalize_journal(journal).to_csv(index=False).encode("utf-8")
+    files["latest_master.csv"]= classement.to_csv(index=False).encode("utf-8")
+    files["points_table.csv"] = points.to_csv(index=False).encode("utf-8")
+
+    # PDFs archivés (miroir)
+    for p in PDF_DONE.glob("*.pdf"):
+        rel = Path("PDF_Traites") / p.name
+        files[str(rel).replace("\\", "/")] = p.read_bytes()
+
+    return files
+
+
+def _git_run(cmd: list[str], cwd: Path, env: dict | None = None) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, cwd=str(cwd), env=env or os.environ.copy(),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return p.returncode, p.stdout.strip()
+    except Exception as e:
+        return 1, f"EXC:{e}"
+
+def _ensure_pub_repo(repo_url: str, token: str, branch: str, repo_dir: Path) -> tuple[bool, str]:
+    """
+    Prépare le repo de travail dans repo_dir :
+      - si déjà cloné : remet l'URL, nettoie d’éventuels extraheaders persistants, fetch/checkout/reset.
+      - sinon : clone proprement la branche demandée.
+    NB : on n’utilise PAS le token ici (le push ajoute l’Authorization via GIT_HTTP_EXTRAHEADER).
+    """
+    repo_url = _normalize_repo_url(repo_url)
+    repo_dir = Path(repo_dir)
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    outlog = []
+
+    def _try_unset_extraheader():
+        # On enlève toute config http.extraheader persistante qui pourrait créer des doublons.
+        _git_run(["git", "config", "--unset-all", "http.https://github.com/.extraheader"], cwd=repo_dir)
+        _git_run(["git", "config", "--unset-all", "http.https://github.com/.extraheader"], cwd=repo_dir.parent)
+
+    if (repo_dir / ".git").exists():
+        # Repo déjà présent : resynchronisation propre
+        _try_unset_extraheader()
+
+        rc, out = _git_run(["git", "remote", "set-url", "origin", repo_url], cwd=repo_dir)
+        outlog.append(f"git remote set-url origin {repo_url} rc={rc}")
+        if rc != 0:
+            return False, "prepare: remote set-url KO"
+
+        rc, out = _git_run(["git", "fetch", "origin", branch], cwd=repo_dir)
+        outlog.append(f"git fetch origin {branch} rc={rc}")
+        if rc != 0:
+            return False, "prepare: fetch KO"
+
+        rc, out = _git_run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo_dir)
+        outlog.append(f"git checkout -B {branch} origin/{branch} rc={rc}")
+        if rc != 0:
+            return False, "prepare: checkout KO"
+
+        rc, out = _git_run(["git", "reset", "--hard", f"origin/{branch}"], cwd=repo_dir)
+        outlog.append(f"git reset --hard origin/{branch} rc={rc}")
+        if rc != 0:
+            return False, "prepare: reset KO"
+
+        return True, "prepare: repo prêt"
+    else:
+        # Pas encore cloné : on (re)clone proprement
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir, ignore_errors=True)
+
+        rc, out = _git_run(["git", "clone", "--branch", branch, repo_url, str(repo_dir)], cwd=repo_dir.parent)
+        outlog.append(f"git clone --branch {branch} {repo_url} {repo_dir} rc={rc}")
+        if rc != 0:
+            return False, f"prepare: clone KO: {out}"
+
+        _try_unset_extraheader()
+        return True, "prepare: repo prêt"
+
+
+
+
 def publish_public_snapshot(push_to_github: bool = False, message: str = "CoronaMax: snapshot") -> tuple[bool, str]:
     """
-    1) Écrit le snapshot local dans BASE/data/ (toujours).
-    2) Si push_to_github=True et GIT_PUBLIC_REPO / GIT_TOKEN sont présents,
-       pousse aussi vers GitHub (branche GIT_BRANCH, défaut 'main') en HTTPS
-       avec en-tête Authorization: Basic <base64(owner:token)>.
+    1) Génère le snapshot local dans BASE/data/.
+    2) Si push_to_github=True, pousse vers le dépôt (branche GIT_BRANCH) en injectant
+       l'Authorization *uniquement* pour le 'git push' via GIT_HTTP_EXTRAHEADER.
     """
-    # ---- 1) Construire + écrire localement
     files = _build_public_snapshot_files()
+
+    # --- Écriture locale (toujours)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     for name, blob in files.items():
-        p = DATA_DIR / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(blob)
+        path = DATA_DIR / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
 
     if not push_to_github:
         return True, "Snapshot locale générée (aucun push GitHub demandé)."
 
-    # ---- 2) Paramètres GitHub
-    repo_input = os.getenv("GIT_PUBLIC_REPO", "").strip()   # "owner/repo" ou URL complète
-    token      = os.getenv("GIT_TOKEN", "").strip()
-    branch     = os.getenv("GIT_BRANCH", "main").strip()
-    author     = os.getenv("GIT_AUTHOR", "CoronaBot <bot@example.com>").strip()
+    repo_url = os.getenv("GIT_PUBLIC_REPO", "").strip()
+    token    = os.getenv("GIT_TOKEN", "").strip()
+    branch   = os.getenv("GIT_BRANCH", "main").strip()
+    author   = os.getenv("GIT_AUTHOR", "CoronaBot <bot@example.com>").strip()
+    
+    repo_url = _normalize_repo_url(repo_url)
 
-    if not repo_input or not token:
+    if not repo_url or not token:
         return False, "Variables GIT_PUBLIC_REPO et/ou GIT_TOKEN manquantes : aucun push GitHub."
 
-    def _slug_from(repo_or_url: str) -> str | None:
-        if repo_or_url.lower().startswith("http"):
-            m = re.match(r"https?://(?:[^@]+@)?github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", repo_or_url, flags=re.I)
-            return m.group(1) if m else None
-        return repo_or_url if "/" in repo_or_url else None
-
-    slug = _slug_from(repo_input)
-    if not slug:
-        return False, f"Repo invalide: {repo_input!r} (attendu 'owner/repo' ou URL GitHub)"
-
-    owner = slug.split("/")[0]
-    clean_url = f"https://github.com/{slug}.git"
-
-    # Prépare le Basic auth header: base64("OWNER:TOKEN") — GitHub accepte OWNER = propriétaire du PAT
-    basic = base64.b64encode(f"{owner}:{token}".encode("utf-8")).decode("ascii")
-    extra_header = f"AUTHORIZATION: Basic {basic}"
-
+    # --- Prépare le repo de travail
     work = BASE / ".pubpush"
     repo = work / "repo"
     work.mkdir(parents=True, exist_ok=True)
 
-    outlog: list[str] = []
+    ok, msg = _ensure_pub_repo(repo_url, token, branch, repo)
+    outlog = [msg]
+    if not ok:
+        return False, "\n".join(outlog)
 
+    # --- Copier DATA_DIR -> repo/data
+    (repo / "data").mkdir(parents=True, exist_ok=True)
+    for p in DATA_DIR.rglob("*"):
+        if p.is_file():
+            rel = p.relative_to(DATA_DIR)
+            dst = (repo / "data" / rel)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
 
-    def run(cmd, cwd=None, env=None):
-        rc, out = _git_run(cmd, cwd=cwd, env=env)
-        # journal lisible, mais sans secrets
-        cmd_str = " ".join(cmd)
-        for secret in (token, basic):
-            if secret:
-                cmd_str = cmd_str.replace(secret, "****")
-                out     = out.replace(secret, "****")
-        outlog.append(f"$ {cmd_str}\nrc={rc}\n{out}".strip())
-        return rc, out
-
-
-    # (A) Préparer le dépôt local
-    try:
-        if repo.exists() and (repo / ".git").exists():
-            run(["git", "remote", "set-url", "origin", clean_url], cwd=repo)
-            run(["git", "fetch", "origin", branch], cwd=repo)
-            run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo)
-        else:
-            if repo.exists():
-                shutil.rmtree(repo, ignore_errors=True)
-            run(["git", "clone", "--branch", branch, clean_url, str(repo)], cwd=work)
-        outlog.append("prepare: repo prêt")
-    except Exception as e:
-        outlog.append(f"prepare: clone/config KO: {e}")
-        return False, "\n\n".join(outlog)
-
-    # (B) Configure identité + header auth
+    # --- Identité commit
     env = os.environ.copy()
     env["GIT_AUTHOR_NAME"]     = (author.split("<")[0].strip() or "CoronaBot")
-    env["GIT_AUTHOR_EMAIL"]    = (author.split("<")[-1].strip(">").strip() or "bot@example.com")
+    env["GIT_AUTHOR_EMAIL"]    = (author.split("<")[-1].strip(">") or "bot@example.com")
     env["GIT_COMMITTER_NAME"]  = env["GIT_AUTHOR_NAME"]
     env["GIT_COMMITTER_EMAIL"] = env["GIT_AUTHOR_EMAIL"]
 
-    # on configure l’en-tête, mais on n’affiche pas sa valeur
-    _rc, _out = _git_run(["git","config", "http.https://github.com/.extraheader", extra_header], cwd=repo, env=env)
-    outlog.append("$ git config http.https://github.com/.extraheader **set**")
-
-
-    try:
-        # (C) Copier data/
-        (repo / "data").mkdir(parents=True, exist_ok=True)
-        for p in DATA_DIR.rglob("*"):
-            if p.is_file():
-                rel = p.relative_to(DATA_DIR)
-                dst = repo / "data" / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(p, dst)
-
-        # (D) Commit + push
-        rc, _ = run(["git", "add", "-A"], cwd=repo, env=env)
-        if rc != 0:
-            return False, "\n\n".join(outlog)
-
-        rc, _ = run(["git", "commit", "-m", message], cwd=repo, env=env)
-        # rc==1 si "nothing to commit" -> ok, on push quand même
-
-        rc, _ = run(["git", "push", "-u", "origin", branch], cwd=repo, env=env)
-        if rc != 0:
-            return False, "\n\n".join(outlog)
-
-        return True, "\n\n".join(outlog)
-    finally:
-        # Retire le header pour ne pas le laisser dans la config
-        run(["git", "config", "--unset-all", f"http.https://github.com/.extraheader"], cwd=repo, env=env)
-
-
-
-def _git_run(cmd: list[str], cwd: Path | None = None, env: dict | None = None, timeout: int = 60) -> tuple[int, str]:
-    """Exécute une commande git, retourne (rc, stdout|stderr)."""
-    try:
-        r = subprocess.run(cmd, cwd=str(cwd) if cwd else None,
-                           capture_output=True, text=True, env=env, timeout=timeout)
-        out = (r.stdout.strip() or r.stderr.strip())
-        return r.returncode, out
-    except Exception as e:
-        return 1, f"EXC:{e}"
-
-
-def _ensure_pub_repo(repo_url: str, token: str, branch: str, repo_dir: Path) -> tuple[bool, str]:
-    """
-    Prépare .pubpush/repo :
-      - clone si absent,
-      - sinon reconfigure l'origin, fetch et checkout branche,
-      - ajoute safe.directory pour éviter 'dubious ownership' (NAS/Windows).
-    """
-    # URL avec token encodé
-    safe = quote(token, safe="")  # URL-encode (token peut contenir _ ou autres)
-    url_with_token = repo_url.replace("https://", f"https://x-access-token:{safe}@")
-
-    # si le dossier existe mais n'est pas un repo -> on l'efface
-    if repo_dir.exists() and not (repo_dir / ".git").exists():
-        shutil.rmtree(repo_dir, ignore_errors=True)
-
-    # clone si nécessaire
-    if not (repo_dir / ".git").exists():
-        if repo_dir.exists():
-            shutil.rmtree(repo_dir, ignore_errors=True)
-        rc, out = _git_run(["git","clone","--depth","1","--branch", branch, url_with_token, str(repo_dir)])
-        if rc != 0:
-            return False, f"clone KO: {out}"
-
-    # safe.directory (Windows/NAS)
-    _git_run(["git","config","--global","--add","safe.directory", str(repo_dir).replace("\\","/")])
-
-    # assure la bonne origin + fetch + checkout
-    _git_run(["git","remote","set-url","origin", url_with_token], cwd=repo_dir)
-    _git_run(["git","fetch","origin", branch], cwd=repo_dir)
-    rc, out = _git_run(["git","checkout", branch], cwd=repo_dir)
+    # --- add / commit
+    rc, out = _git_run(["git", "add", "-A"], cwd=repo, env=env)
+    outlog.append(f"git add: rc={rc} {out}")
     if rc != 0:
-        # créer la branche si elle n'existe pas localement
-        rc, out = _git_run(["git","checkout","-b", branch], cwd=repo_dir)
-        if rc != 0:
-            return False, f"checkout KO: {out}"
-    # rebase sur origin/branch (au cas où)
-    _git_run(["git","pull","--rebase","origin", branch], cwd=repo_dir)
+        return False, "\n".join(outlog)
 
-    return True, "repo prêt"
+    rc, out = _git_run(["git", "commit", "-m", message], cwd=repo, env=env)
+    outlog.append(f"git commit: rc={rc} {out}")
+    # rc peut être 1 avec "nothing to commit" -> on continue quand même
+
+    # --- Push avec Authorization injecté *uniquement* via l'env
+    import base64
+    auth_b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+
+    env2 = env.copy()
+    env2["GIT_HTTP_EXTRAHEADER"] = f"AUTHORIZATION: Basic {auth_b64}"
+
+    rc, out = _git_run(["git", "push", "-u", "origin", branch], cwd=repo, env=env2)
+    outlog.append(f"git push: rc={rc} {out}")
+    if rc != 0:
+        return False, "\n".join(outlog)
+
+    return True, "\n".join(outlog)
