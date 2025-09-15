@@ -81,31 +81,54 @@ DATA_PDF_TRAITES = DATA_DIR / "PDF_Traites"   # public snapshot location
 
 def get_pdf_archive_dir() -> Path:
     """
-    Returns the directory that contains archived PDFs depending on the mode
-    and what actually exists on disk. This makes the Archives page work both
-    locally and online.
-    Preference:
-      - public mode: data/PDF_Traites (new) -> data/PDF_TRAITES -> ARCHIVE/PDF_Traites -> ARCHIVE/PDF_TRAITES
-      - local mode : ARCHIVE/PDF_TRAITES (existing) -> data/PDF_Traites
+    Return the directory that contains archived tournament PDFs.
+
+    - Public mode (CMX_MODE=public): prefer data/PDF_Traites (snapshot).
+      Fallbacks: data/PDF_TRAITES, then ARCHIVE/PDF_TRAITES if present.
+    - Local/Admin (default): prefer ARCHIVE/PDF_TRAITES (live archive).
+      Fallbacks: data/PDF_Traites (if you want to preview the snapshot locally).
+
+    The first existing folder that contains PDFs is returned; otherwise the
+    first candidate for the current mode is created and returned.
     """
-    if IS_PUBLIC:
-        for cand in [
-            DATA_PDF_TRAITES,
-            DATA_DIR / "PDF_TRAITES",
-            ARCHIVE / "PDF_Traites",
-            ARCHIVE / "PDF_TRAITES",
-        ]:
-            if cand.exists():
-                return cand
-        return DATA_PDF_TRAITES
+    # Try to reuse a module-level flag if you have one; otherwise re-evaluate.
+    is_public = bool(globals().get("IS_PUBLIC",
+                    os.getenv("CMX_MODE", "local").lower() == "public"))
+
+    candidates: list[Path] = []
+    if is_public:
+        # Snapshot layout (as pushed by publish_public_snapshot)
+        candidates += [
+            DATA_DIR / "PDF_Traites",   # canonical in /data
+            DATA_DIR / "PDF_TRAITES",   # tolerate other casing
+            ARCHIVE / "PDF_TRAITES",    # ultimate fallback if present
+        ]
     else:
-        for cand in [
-            PDF_DONE_LOCAL,
-            DATA_PDF_TRAITES,
-        ]:
-            if cand.exists():
-                return cand
-        return PDF_DONE_LOCAL
+        # Local/admin layout
+        candidates += [
+            PDF_DONE,                    # ARCHIVE/PDF_TRAITES
+            ARCHIVE / "PDF_TRAITES",     # tolerate duplicate constant naming
+            DATA_DIR / "PDF_Traites",    # fallback to snapshot, if exists
+        ]
+
+    # Prefer a directory that actually has PDFs
+    for p in candidates:
+        if p.exists():
+            try:
+                if any(p.glob("*.pdf")):
+                    return p
+            except Exception:
+                pass
+
+    # If none exist / empty, return the first candidate for the mode.
+    target = candidates[0]
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If creation fails (e.g., read-only in public), just return it
+        # and let the caller show "Aucun PDF archivé".
+        pass
+    return target
 
 
 def _normalize_repo_url(repo_url: str) -> str:
