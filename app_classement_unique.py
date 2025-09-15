@@ -75,6 +75,39 @@ for d in (ARCHIVE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR):
 IS_PUBLIC = os.getenv("CMX_MODE", "local").lower() == "public"
 
 
+# --- add these aliases (keep your existing constants) ---
+PDF_DONE_LOCAL = ARCHIVE / "PDF_TRAITES"      # local archive (existing)
+DATA_PDF_TRAITES = DATA_DIR / "PDF_Traites"   # public snapshot location
+
+def get_pdf_archive_dir() -> Path:
+    """
+    Returns the directory that contains archived PDFs depending on the mode
+    and what actually exists on disk. This makes the Archives page work both
+    locally and online.
+    Preference:
+      - public mode: data/PDF_Traites (new) -> data/PDF_TRAITES -> ARCHIVE/PDF_Traites -> ARCHIVE/PDF_TRAITES
+      - local mode : ARCHIVE/PDF_TRAITES (existing) -> data/PDF_Traites
+    """
+    if IS_PUBLIC:
+        for cand in [
+            DATA_PDF_TRAITES,
+            DATA_DIR / "PDF_TRAITES",
+            ARCHIVE / "PDF_Traites",
+            ARCHIVE / "PDF_TRAITES",
+        ]:
+            if cand.exists():
+                return cand
+        return DATA_PDF_TRAITES
+    else:
+        for cand in [
+            PDF_DONE_LOCAL,
+            DATA_PDF_TRAITES,
+        ]:
+            if cand.exists():
+                return cand
+        return PDF_DONE_LOCAL
+
+
 def _normalize_repo_url(repo_url: str) -> str:
     """
     Accepte:
