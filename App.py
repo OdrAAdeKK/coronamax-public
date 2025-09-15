@@ -466,17 +466,24 @@ elif page == "📚 Archives":
         st.info("Pas d’historique pour le moment.")
     else:
         d = st.date_input("Afficher l’état au", value=date.today())
+        # IMPORTANT : filtre sur la date du tournoi (start_time), pas la date de traitement
         sub = log[log["start_time"].dt.date <= d].copy()
         table = standings_from_log(sub, season_only=False)
         show_table(table, caption=f"État arrêté au {d:%d/%m/%Y}")
 
     # PDFs archivés
     st.subheader("PDFs archivés (par saison)")
-    # utiliser les PDFs du snapshot en public, et l’archive locale en admin/local
-    from app_classement_unique import DATA_DIR  # <-- assure-toi que c’est importé en haut si pas déjà
 
-    src_dir = (DATA_DIR / "PDF_Traites") if IS_PUBLIC else PDF_DONE
-    pdfs = list_files_sorted(src_dir, ("*.pdf",))
+    # Utilise le répertoire correct (public: data/PDF_Traites ; local: ARCHIVE/PDF_TRAITES)
+    try:
+        from app_classement_unique import get_pdf_archive_dir
+        pdf_root = get_pdf_archive_dir()
+    except Exception:
+        # Fallback si le helper n'est pas dispo (ancienne version)
+        from app_classement_unique import DATA_DIR
+        pdf_root = (DATA_DIR / "PDF_Traites") if IS_PUBLIC else PDF_DONE
+
+    pdfs = list_files_sorted(pdf_root, ("*.pdf",))
 
     if not pdfs:
         st.caption("Aucun PDF archivé.")
@@ -484,22 +491,40 @@ elif page == "📚 Archives":
         with st.expander("Saison courante", expanded=True):
             for p in pdfs:
                 cols = st.columns([6, 2, 2])
-                cols[0].write(f"**{p.name}**  \n_{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}_")
+                # gauche : nom + date de modif fichier
+                cols[0].write(
+                    f"**{p.name}**  \n_{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}_"
+                )
+
+                # milieu : téléchargement du PDF
                 with cols[1]:
-                    st.download_button("Télécharger (PDF)", data=p.read_bytes(),
-                                       file_name=p.name, type="secondary", key=f"dlpdf_{p.name}")
+                    st.download_button(
+                        "Télécharger (PDF)",
+                        data=p.read_bytes(),
+                        file_name=p.name,
+                        type="secondary",
+                        key=f"dlpdf_{p.name}",
+                    )
+
+                # droite : génération / téléchargement du JPG (1re page)
                 with cols[2]:
                     try:
                         jpg_path = SNAP_DIR / "archived_jpg" / (p.stem + ".jpg")
-                        need_regen = (not jpg_path.exists()) or (jpg_path.stat().st_mtime < p.stat().st_mtime)
+                        need_regen = (not jpg_path.exists()) or (
+                            jpg_path.stat().st_mtime < p.stat().st_mtime
+                        )
                         if need_regen:
                             pdf_first_page_to_jpg(p, jpg_path, dpi=220)
-                        st.download_button("Télécharger (JPG)", data=jpg_path.read_bytes(),
-                                           file_name=jpg_path.name, type="secondary", key=f"dljpg_{p.name}")
+                        st.download_button(
+                            "Télécharger (JPG)",
+                            data=jpg_path.read_bytes(),
+                            file_name=jpg_path.name,
+                            type="secondary",
+                            key=f"dljpg_{p.name}",
+                        )
                     except Exception as e:
                         st.button("JPG indisponible", disabled=True, key=f"nojpg_{p.name}")
                         st.caption(f"⚠️ Conversion JPG échouée : {e}")
-
 
 # =============================================================================
 # 4) 🏅 Classement par points
