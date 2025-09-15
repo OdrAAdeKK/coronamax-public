@@ -472,7 +472,12 @@ elif page == "📚 Archives":
 
     # PDFs archivés
     st.subheader("PDFs archivés (par saison)")
-    pdfs = list_files_sorted(PDF_DONE, ("*.pdf",))
+    # utiliser les PDFs du snapshot en public, et l’archive locale en admin/local
+    from app_classement_unique import DATA_DIR  # <-- assure-toi que c’est importé en haut si pas déjà
+
+    src_dir = (DATA_DIR / "PDF_Traites") if IS_PUBLIC else PDF_DONE
+    pdfs = list_files_sorted(src_dir, ("*.pdf",))
+
     if not pdfs:
         st.caption("Aucun PDF archivé.")
     else:
@@ -559,16 +564,20 @@ elif page == "⬆️ Importer":
                 rows_preview = build_rows_for_log(parsed)
                 if rows_preview.empty:
                     st.warning(f"⚠️ {f.name} : 0 ligne détectée (non ajouté).")
-                    safe_unlink(tmp); continue
+                    safe_unlink(tmp)
+                    continue
                 st.session_state.pending_tourneys[parsed.tournament_id] = {
-                    "df": rows_preview, "src_path": str(tmp),
-                    "name": parsed.tournament_name, "start_time": parsed.start_time
+                    "df": rows_preview,
+                    "src_path": str(tmp),
+                    "name": parsed.tournament_name,
+                    "start_time": parsed.start_time,
                 }
                 logs.append(f"✅ Ajouté : {f.name} — {len(rows_preview)} ligne(s)")
             except Exception as e:
                 safe_unlink(tmp)
                 logs.append(f"❌ Erreur sur {f.name} : {e}")
-        if logs: st.text("\n".join(logs))
+        if logs:
+            st.text("\n".join(logs))
         st.info("Faites défiler pour valider chaque tournoi.")
 
     if not st.session_state.pending_tourneys:
@@ -576,37 +585,91 @@ elif page == "⬆️ Importer":
     else:
         st.subheader("Tournois en attente de validation")
         to_rerun = False
+
         for tid, item in list(st.session_state.pending_tourneys.items()):
             st.markdown(f"**{item['name']} — {pd.to_datetime(item['start_time']):%d/%m/%Y %H:%M}**")
-            edit = st.data_editor(item["df"], num_rows="dynamic", width="stretch", hide_index=True, key=f"edit_{tid}")
+            edit = st.data_editor(
+                item["df"], num_rows="dynamic", width="stretch", hide_index=True, key=f"edit_{tid}"
+            )
             bubble_name = compute_bubble_from_rows(edit)
             st.info(f"**Bulle détectée :** {bubble_name or '(aucune)'}")
 
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("✅ Valider ce tournoi", key=f"commit_{tid}"):
+                    # 1) Append au log
                     append_results_log(edit.copy())
+
+                    # 2) Journal + archivage du PDF
                     journal = load_journal()
-                    journal.loc[len(journal)] = {"sha1":tid, "filename": Path(item["src_path"]).name, "processed_at": datetime.now()}
+                    journal.loc[len(journal)] = {
+                        "sha1": tid,
+                        "filename": Path(item["src_path"]).name,
+                        "processed_at": datetime.now(),
+                    }
                     save_journal(journal)
                     archive_pdf(Path(item["src_path"]))
                     del st.session_state.pending_tourneys[tid]
+
+                    # 3) Rebuild des snapshots (gains + points + miroirs publics)
+                    from app_classement_unique import (
+                        load_results_log_any,
+                        standings_from_log,
+                        compute_points_table,
+                        current_season_bounds,
+                        DATA_DIR,
+                    )
+
                     cur_log = load_results_log_any()
-                    table = standings_from_log(cur_log, season_only=False)
-                    (DATA_DIR / "latest_master.csv").write_text(table.to_csv(index=False), encoding="utf-8")
+                    table_gains = standings_from_log(cur_log, season_only=False)
+
+                    # Points sur la saison courante
+                    s0, s1 = current_season_bounds()
+                    table_points = compute_points_table(cur_log, d1=s0, d2=s1)
+
+                    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+                    # Gains
+                    (DATA_DIR / "latest_master.csv").write_text(
+                        table_gains.to_csv(index=False), encoding="utf-8"
+                    )
+                    # Points (saison en cours)
+                    (DATA_DIR / "points_table.csv").write_text(
+                        table_points.to_csv(index=False), encoding="utf-8"
+                    )
+                    # Journal public
+                    (DATA_DIR / "journal.csv").write_text(
+                        journal.to_csv(index=False), encoding="utf-8"
+                    )
+                    # Miroir du results_log (utile si append_results_log ne le fait pas déjà)
+                    try:
+                        (DATA_DIR / "results_log.csv").write_text(
+                            cur_log.to_csv(index=False), encoding="utf-8"
+                        )
+                    except Exception as e:
+                        print(f"[Importer] WARNING: miroir data/results_log.csv KO: {e}")
+
+                    # 4) Diagnostics
+                    st.caption(f"📄 ARCHIVE/results_log.csv → {len(cur_log)} lignes")
+                    st.caption(f"🧮 latest_master.csv: {len(table_gains)} lignes")
+                    st.caption(f"🏅 points_table.csv: {len(table_points)} lignes")
+
                     st.success("Tournoi ajouté. Classement mis à jour.")
                     to_rerun = True
+
             with c2:
                 if st.button("🗑️ Annuler / retirer de la file", key=f"cancel_{tid}"):
                     safe_unlink(Path(item["src_path"]))
                     del st.session_state.pending_tourneys[tid]
                     st.warning("Tournoi retiré de la file.")
                     to_rerun = True
+
             st.divider()
 
         if to_rerun:
             st.rerun()
 
+        # Rollback
         st.subheader("Annuler le dernier import")
         if st.button("🧹 Annuler le dernier tournoi importé"):
             info = rollback_last_import()
@@ -614,7 +677,7 @@ elif page == "⬆️ Importer":
                 st.success(f"{info['msg']} — PDF remis: {info.get('pdf_back','')}")
                 st.rerun()
             else:
-                st.info(info.get("msg","Rien à annuler."))
+                st.info(info.get("msg", "Rien à annuler."))
 
 
 # =============================================================================

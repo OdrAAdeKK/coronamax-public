@@ -193,8 +193,16 @@ def safe_unlink(p: Path, retries: int = 5, delay: float = 0.2) -> None:
 
 
 def _choose_public_or_local(public_rel: str, local_path: Path) -> Path:
+    """
+    - En mode PUBLIC: on lit d'abord data/public_rel, sinon fallback local_path.
+    - En mode LOCAL/ADMIN: on lit d'abord local_path (ARCHIVE), sinon fallback data/public_rel.
+    """
     pp = DATA_DIR / public_rel
-    return pp if pp.exists() else local_path
+    if IS_PUBLIC:
+        return pp if pp.exists() else local_path
+    # Mode local/admin : priorité au CSV local (ARCHIVE)
+    return local_path if local_path.exists() else pp
+
 
 def load_results_log_any() -> pd.DataFrame:
     p = _choose_public_or_local("results_log.csv", RESULTS_LOG)
@@ -235,15 +243,36 @@ def load_journal() -> pd.DataFrame:
 
     return _normalize_journal(df)
 
-
 def save_journal(df: pd.DataFrame) -> None:
-    _normalize_journal(df).to_csv(JOURNAL_CSV, index=False, encoding="utf-8")
+    d = _normalize_journal(df)
+    # 1) Fichier de travail (ARCHIVE)
+    d.to_csv(JOURNAL_CSV, index=False, encoding="utf-8")
+    # 2) Miroir public (data/)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "journal.csv").write_text(d.to_csv(index=False), encoding="utf-8")
+    except Exception:
+        pass
+
 
 def append_results_log(df_rows: pd.DataFrame) -> None:
-    cur = load_results_log_any()
+    """Append rows to RESULTS_LOG (schéma normalisé) et miroiter dans data/."""
+    cur = load_results_log_any()  # peut venir de data/ si présent
     add = _normalize_results_log(df_rows)
     out = pd.concat([cur, add], ignore_index=True)
+    out = _normalize_results_log(out)
+
+    # 1) Fichier de travail (ARCHIVE)
     out.to_csv(RESULTS_LOG, index=False, encoding="utf-8")
+
+    # 2) Miroir public (data/)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "results_log.csv").write_text(out.to_csv(index=False), encoding="utf-8")
+    except Exception:
+        # on n’échoue pas l’opération si le miroir public n’est pas accessible
+        pass
+
 
 def save_master_df(df: pd.DataFrame, path: Optional[Path] = None) -> None:
     p = path or (DATA_DIR / "latest_master.csv")
@@ -833,6 +862,7 @@ def archive_pdf(src: Path) -> Path:
     return dest
 
 def rollback_last_import() -> dict:
+    """Supprime les dernières lignes du log (dernier tournoi) et remet le PDF en entrée si possible."""
     log = load_results_log_any()
     if log.empty:
         return {"ok": False, "msg": "Log vide."}
@@ -843,7 +873,14 @@ def rollback_last_import() -> dict:
     last_id = last_ids[-1]
 
     log2 = log[log["tournament_id"] != last_id].copy()
+    # 1) ARCHIVE
     log2.to_csv(RESULTS_LOG, index=False, encoding="utf-8")
+    # 2) data/ (miroir)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "results_log.csv").write_text(log2.to_csv(index=False), encoding="utf-8")
+    except Exception:
+        pass
 
     back_pdf = ""
     pdfs = sorted(PDF_DONE.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -858,6 +895,7 @@ def rollback_last_import() -> dict:
 # =============================================================================
 # Publication snapshot (local + push Git)
 # =============================================================================
+
 
 def _build_public_snapshot_files() -> dict[str, bytes]:
     log = load_results_log_any()
@@ -953,6 +991,37 @@ def _ensure_pub_repo(repo_url: str, token: str, branch: str, repo_dir: Path) -> 
         return True, "prepare: repo prêt"
 
 
+def _copy_archived_pdfs_to_snapshot() -> int:
+    """Copie tous les PDFs archivés vers data/PDF_Traites/ (écrase si plus récent/ différent).
+    Retourne le nombre de PDFs copiés."""
+    outdir = DATA_DIR / "PDF_Traites"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # On tolère les deux graphies possibles et on déduplique
+    candidate_dirs = []
+    for d in {ARCHIVE / "PDF_TRAITES", ARCHIVE / "PDF_Traites"}:
+        if d.exists() and d.is_dir():
+            candidate_dirs.append(d)
+
+    count = 0
+    for base in candidate_dirs:
+        for p in base.rglob("*.pdf"):
+            try:
+                dst = outdir / p.name
+                # Copie seulement si le dst n'existe pas ou différent (taille/mtime)
+                need = (
+                    (not dst.exists()) or
+                    (p.stat().st_mtime > dst.stat().st_mtime) or
+                    (p.stat().st_size != dst.stat().st_size)
+                )
+                if need:
+                    shutil.copy2(p, dst)
+                count += 1
+            except Exception as e:
+                print(f"[snapshot] copy PDF failed {p}: {e}")
+    return count
+
+
 
 
 def publish_public_snapshot(push_to_github: bool = False, message: str = "CoronaMax: snapshot") -> tuple[bool, str]:
@@ -963,15 +1032,20 @@ def publish_public_snapshot(push_to_github: bool = False, message: str = "Corona
     """
     files = _build_public_snapshot_files()
 
-    # --- Écriture locale (toujours)
+    # Écriture locale (toujours)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     for name, blob in files.items():
         path = DATA_DIR / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(blob)
 
+    # 👉 NOUVEAU : inclure aussi les PDFs archivés dans le snapshot local
+    pdf_copied = _copy_archived_pdfs_to_snapshot()
+
+
     if not push_to_github:
-        return True, "Snapshot locale générée (aucun push GitHub demandé)."
+        return True, f"Snapshot locale générée (CSV) + {pdf_copied} PDF(s) copiés dans data/PDF_Traites/."
+
 
     repo_url = os.getenv("GIT_PUBLIC_REPO", "").strip()
     token    = os.getenv("GIT_TOKEN", "").strip()
