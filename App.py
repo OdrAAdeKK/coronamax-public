@@ -4,7 +4,8 @@ from __future__ import annotations
 import os, re, io, shutil
 from datetime import datetime, date
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union, List
+
 
 import numpy as np
 import pandas as pd
@@ -139,23 +140,23 @@ def style_dataframe(d: pd.DataFrame) -> pd.io.formats.style.Styler:
     sty = sty.format(fmt)
     return sty
 
-def show_table(df, height: int | str | None = None, caption: str | None = None):
+def show_table(df, height: Optional[Union[int, str]] = None, caption: Optional[str] = None):
     """
     Affiche le tableau avec le style existant.
-    - height: entier (px) ou "auto" ou "stretch". Si None, on n'envoie pas le paramètre
+    - height: entier (px) ou "auto"/"stretch". Si None, on n'envoie pas le paramètre
       et on applique un CSS anti-scroll pour auto-ajuster la hauteur.
     """
-    styled = style_dataframe(df)
+    styled = style_dataframe(df)  # conserve ta mise en forme
 
     kwargs = dict(width="stretch", hide_index=True)
 
     if isinstance(height, int) or height in ("auto", "stretch"):
         kwargs["height"] = height
     else:
+        # Fallback anti-scroll compatible toutes versions
         st.markdown(
             """
             <style>
-            /* Auto-hauteur du grid quand peu de lignes (évite le scroll) */
             div[data-testid="stDataFrame"] div[role="grid"] { height: auto; }
             </style>
             """,
@@ -274,12 +275,13 @@ page = st.sidebar.radio("Navigation", NAV_PUBLIC if (IS_PUBLIC or not is_admin()
 # --- Helper hauteur auto pour tables ---------------------------------
 def _auto_table_height(df, max_rows_no_scroll: int = 40,
                        row_px: int = 34, header_px: int = 38, padding_px: int = 16,
-                       min_px: int = 200, max_px: int | None = None) -> int:
+                       min_px: int = 200, max_px: Optional[int] = None) -> int:
     n = min(len(df), max_rows_no_scroll)
     h = header_px + padding_px + row_px * max(n, 1)
     if max_px is not None:
         h = min(h, max_px)
     return max(h, min_px)
+
 
 
 # =============================================================================
