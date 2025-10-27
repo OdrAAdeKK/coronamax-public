@@ -40,6 +40,23 @@ footer {visibility: hidden;}
 """
 st.markdown(HIDE_CHROME, unsafe_allow_html=True)
 
+
+# --- Compat Streamlit Cloud : SelectboxColumn peut ne pas exister ------------
+def _selectbox_col(label: str, options: list[str], **kwargs):
+    """
+    Retourne st.column_config.SelectboxColumn si dispo,
+    sinon retombe sur TextColumn (saisie libre).
+    """
+    cc = getattr(st, "column_config", None)
+    if cc and hasattr(cc, "SelectboxColumn"):
+        try:
+            return cc.SelectboxColumn(label, options=options, **kwargs)
+        except Exception:
+            pass
+    # Fallback (anciennes versions)
+    help_msg = kwargs.get("help")
+    return st.column_config.TextColumn(label, help=help_msg or "Saisie libre")
+
 # -----------------------------------------------------------------------------
 # Helpers UI
 # -----------------------------------------------------------------------------
