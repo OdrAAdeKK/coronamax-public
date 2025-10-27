@@ -122,19 +122,28 @@ def style_dataframe(d: pd.DataFrame) -> pd.io.formats.style.Styler:
 
 def show_table(df, height: int | str | None = None, caption: str | None = None):
     """
-    Affiche le tableau avec le style existant. `height` est optionnel.
-    - height: entier (px) ou "auto" ou "stretch". Si None, on ne passe pas le paramètre.
+    Affiche le tableau stylé. Compatible anciennes versions Streamlit (Cloud).
+    - height: int (px) ou "auto"/"stretch". Si None, non passé.
     """
-    styled = style_dataframe(df)  # ⬅️ garde ta mise en forme existante
+    styled = style_dataframe(df)
 
-    # Construire les kwargs Streamlit sans height par défaut
-    kwargs = dict(width="stretch", hide_index=True)
-
-    # Injecter 'height' uniquement s'il est valable
-    if isinstance(height, int) or height in ("auto", "stretch"):
-        kwargs["height"] = height  # OK: Streamlit accepte int / "auto" / "stretch"
-
-    st.dataframe(styled, **kwargs)
+    # 1) Essaye la nouvelle API (Streamlit récents)
+    try:
+        kwargs = dict(hide_index=True, width="stretch")
+        if isinstance(height, int) or height in ("auto", "stretch"):
+            kwargs["height"] = height
+        st.dataframe(styled, **kwargs)
+    except TypeError:
+        # 2) Fallback anciennes versions (Cloud) : pas de width="stretch", ni "auto"
+        legacy = {}
+        # Anciennes versions n'acceptent que un int pour height
+        if isinstance(height, int):
+            legacy["height"] = height
+        try:
+            st.dataframe(styled, use_container_width=True, **legacy)
+        except TypeError:
+            # 3) Très ancien: aucun extra
+            st.dataframe(styled)
 
     if caption:
         st.caption(caption)
