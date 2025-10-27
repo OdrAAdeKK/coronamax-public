@@ -122,22 +122,34 @@ def style_dataframe(d: pd.DataFrame) -> pd.io.formats.style.Styler:
 
 def show_table(df, height: int | str | None = None, caption: str | None = None):
     """
-    Affiche le tableau avec le style existant. `height` est optionnel.
-    - height: entier (px) ou "auto" ou "stretch". Si None, on ne passe pas le paramètre.
+    Affiche le tableau avec le style existant.
+    - height: entier (px) ou "auto" ou "stretch". Si None, on n'envoie pas le paramètre
+      et on applique un CSS anti-scroll pour auto-ajuster la hauteur.
     """
-    styled = style_dataframe(df)  # ⬅️ garde ta mise en forme existante
+    styled = style_dataframe(df)  # ← conserve ta mise en forme
 
-    # Construire les kwargs Streamlit sans height par défaut
+    # kwargs de base
     kwargs = dict(width="stretch", hide_index=True)
 
-    # Injecter 'height' uniquement s'il est valable
+    # Hauteur : passe-la seulement si valide, sinon CSS anti-scroll
     if isinstance(height, int) or height in ("auto", "stretch"):
-        kwargs["height"] = height  # OK: Streamlit accepte int / "auto" / "stretch"
+        kwargs["height"] = height
+    else:
+        st.markdown(
+            """
+            <style>
+            /* Auto-hauteur du grid quand peu de lignes (évite le scroll) */
+            div[data-testid="stDataFrame"] div[role="grid"] { height: auto; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.dataframe(styled, **kwargs)
 
     if caption:
         st.caption(caption)
+
 
 # --- ROSTER joueurs (pseudos connus) ----------------------------------------
 from app_classement_unique import DATA_DIR, load_results_log_any
@@ -660,6 +672,11 @@ elif page == "⬆️ Importer":
 
 # --- Saisie manuelle (NOUVEAU) -------------------------------------------
 
+# Compat Cloud : certaines versions n'ont pas SelectboxColumn
+_HAS_SELECTBOX_COL = hasattr(st, "column_config") and hasattr(st.column_config, "SelectboxColumn")
+
+
+
 with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
     t_name = st.text_input("Nom du tournoi", placeholder="Ex. CoronaMax #123")
 
@@ -715,12 +732,14 @@ with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
                 "Pseudo",
                 options=known_pseudos,
                 help="Tape pour filtrer les pseudos connus"
-            ) if assist else st.column_config.TextColumn("Pseudo", help="Saisie libre")
+            ) if (assist and _HAS_SELECTBOX_COL) else
+            st.column_config.TextColumn("Pseudo", help="Saisie libre")
         ),
         "GainsCash": st.column_config.NumberColumn("Gains (€)", format="%.2f", help="Gains cash"),
         "Bounty": st.column_config.NumberColumn("Bounty (€)", format="%.2f"),
         "Reentry": st.column_config.NumberColumn("Recaves", step=1, format="%d"),
     }
+
 
     manual_edit = st.data_editor(
         st.session_state.manual_rows_df,
