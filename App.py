@@ -140,16 +140,26 @@ def style_dataframe(d: pd.DataFrame) -> pd.io.formats.style.Styler:
     sty = sty.format(fmt)
     return sty
 
+# Compat typing (Py<3.10)
+
+
 def show_table(df, height: Optional[Union[int, str]] = None, caption: Optional[str] = None):
     """
-    Affiche le tableau avec le style existant.
-    - height: entier (px) ou "auto"/"stretch". Si None, on n'envoie pas le paramètre
-      et on applique un CSS anti-scroll pour auto-ajuster la hauteur.
+    Affiche le tableau avec style si possible.
+    - height: int (px) ou "auto"/"stretch". Si None, on applique un CSS anti-scroll.
+    - Tolérant: si le styler ou st.dataframe plante (Cloud), on dégrade proprement.
     """
-    styled = style_dataframe(df)  # conserve ta mise en forme
+    # 1) Essayer de construire le Styler
+    styled_obj = None
+    try:
+        styled_obj = style_dataframe(df)  # ta mise en forme habituelle
+    except Exception as e:
+        # Dégradation: pas de style, mais on affiche quand même
+        st.info("Compat: style désactivé temporairement (environnement distant).")
+        styled_obj = df
 
+    # 2) Préparer kwargs pour Streamlit
     kwargs = dict(width="stretch", hide_index=True)
-
     if isinstance(height, int) or height in ("auto", "stretch"):
         kwargs["height"] = height
     else:
@@ -163,11 +173,17 @@ def show_table(df, height: Optional[Union[int, str]] = None, caption: Optional[s
             unsafe_allow_html=True,
         )
 
-    st.dataframe(styled, **kwargs)
+    # 3) Afficher avec st.dataframe; si ça plante, repli st.data_editor, puis st.table
+    try:
+        st.dataframe(styled_obj, **kwargs)
+    except Exception:
+        try:
+            st.data_editor(df, **{k: v for k, v in kwargs.items() if k != "height"}, disabled=True)
+        except Exception:
+            st.table(df)  # dernier repli, mais au moins ça s'affiche
 
     if caption:
         st.caption(caption)
-
 
 # --- ROSTER joueurs (pseudos connus) ----------------------------------------
 from app_classement_unique import DATA_DIR, load_results_log_any
