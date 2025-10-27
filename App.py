@@ -708,7 +708,7 @@ with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
         t_buyin = st.number_input("Buy-in total (Buy-in + Rake)", min_value=0.0, step=0.5, format="%.2f", key="manual_buyin")
 
     # --- Helpers roster (pseudos connus) ---------------------------------
-    def _load_roster() -> list[str]:
+    def _load_roster() -> List[str]:
         try:
             from app_classement_unique import DATA_DIR, load_results_log_any
             roster_csv = Path(DATA_DIR) / "players_roster.csv"
@@ -723,7 +723,7 @@ with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
         except Exception:
             return []
 
-    def _save_roster(pseudos: list[str]) -> None:
+    def _save_roster(pseudos: List[str]) -> None:
         try:
             from app_classement_unique import DATA_DIR
             DATA_DIR.mkdir(parents=True, exist_ok=True)
