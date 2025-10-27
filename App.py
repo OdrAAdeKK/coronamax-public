@@ -40,6 +40,25 @@ footer {visibility: hidden;}
 """
 st.markdown(HIDE_CHROME, unsafe_allow_html=True)
 
+
+
+# --- Diagnostics & compat Cloud --------------------------------------------
+# Afficher le vrai traceback à l'écran (au lieu du "Oh no.")
+try:
+    st.set_option("client.showErrorDetails", True)
+except Exception:
+    pass
+
+# Matplotlib en mode headless (Cloud)
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+except Exception:
+    pass
+
+# Détecter si la version Streamlit supporte la SelectboxColumn
+_HAS_SELECTBOX_COL = hasattr(st, "column_config") and hasattr(st.column_config, "SelectboxColumn")
+
 # -----------------------------------------------------------------------------
 # Helpers UI
 # -----------------------------------------------------------------------------
@@ -126,12 +145,10 @@ def show_table(df, height: int | str | None = None, caption: str | None = None):
     - height: entier (px) ou "auto" ou "stretch". Si None, on n'envoie pas le paramètre
       et on applique un CSS anti-scroll pour auto-ajuster la hauteur.
     """
-    styled = style_dataframe(df)  # ← conserve ta mise en forme
+    styled = style_dataframe(df)
 
-    # kwargs de base
     kwargs = dict(width="stretch", hide_index=True)
 
-    # Hauteur : passe-la seulement si valide, sinon CSS anti-scroll
     if isinstance(height, int) or height in ("auto", "stretch"):
         kwargs["height"] = height
     else:
@@ -739,6 +756,7 @@ with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
         "Bounty": st.column_config.NumberColumn("Bounty (€)", format="%.2f"),
         "Reentry": st.column_config.NumberColumn("Recaves", step=1, format="%d"),
     }
+
 
 
     manual_edit = st.data_editor(
