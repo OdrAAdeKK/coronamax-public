@@ -17,7 +17,8 @@ from app_classement_unique import (
     parse_money, euro, current_season_bounds,
     load_results_log_any, load_latest_master_any,
     load_journal, save_journal, append_results_log,
-    extract_from_pdf, build_rows_for_log,
+    extract_from_pdf, build_rows_for_log, build_manual_rows_for_log,
+    render_manual_results_pdf,
     standings_from_log, compute_points_table,
     compute_bubble_from_rows,
     classement_df_to_jpg, classement_points_df_to_jpg,
@@ -119,13 +120,60 @@ def style_dataframe(d: pd.DataFrame) -> pd.io.formats.style.Styler:
     sty = sty.format(fmt)
     return sty
 
-def show_table(df: pd.DataFrame, caption: Optional[str] = None):
-    if df is None or df.empty:
-        st.info("Aucune donnée pour l’instant. Va dans **Importer** pour traiter des PDFs.")
-        return
+def show_table(df, height: int | str | None = None, caption: str | None = None):
+    """
+    Affiche le tableau avec le style existant. `height` est optionnel.
+    - height: entier (px) ou "auto" ou "stretch". Si None, on ne passe pas le paramètre.
+    """
+    styled = style_dataframe(df)  # ⬅️ garde ta mise en forme existante
+
+    # Construire les kwargs Streamlit sans height par défaut
+    kwargs = dict(width="stretch", hide_index=True)
+
+    # Injecter 'height' uniquement s'il est valable
+    if isinstance(height, int) or height in ("auto", "stretch"):
+        kwargs["height"] = height  # OK: Streamlit accepte int / "auto" / "stretch"
+
+    st.dataframe(styled, **kwargs)
+
     if caption:
         st.caption(caption)
-    st.dataframe(style_dataframe(df), use_container_width=True, hide_index=True)
+
+# --- ROSTER joueurs (pseudos connus) ----------------------------------------
+from app_classement_unique import DATA_DIR, load_results_log_any
+
+ROSTER_CSV = DATA_DIR / "players_roster.csv"
+
+def load_roster() -> list[str]:
+    """Charge la liste des pseudos connus (depuis DATA/players_roster.csv).
+    Si le fichier n'existe pas, on la dérive du results_log actuel."""
+    try:
+        if ROSTER_CSV.exists():
+            df = pd.read_csv(ROSTER_CSV)
+            pseudos = (
+                df.get("Pseudo", pd.Series([], dtype=str))
+                  .astype(str).str.strip()
+                  .dropna().unique().tolist()
+            )
+        else:
+            log = load_results_log_any()
+            pseudos = (
+                log.get("Pseudo", pd.Series([], dtype=str))
+                   .astype(str).str.strip()
+                   .dropna().unique().tolist()
+            )
+        # tri insensible à la casse, sans doublons vides
+        pseudos = sorted({p for p in pseudos if p.strip()}, key=str.casefold)
+        return pseudos
+    except Exception:
+        return []
+
+def save_roster(pseudos: list[str]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({"Pseudo": sorted({p.strip() for p in pseudos if p.strip()}, key=str.casefold)})
+    df.to_csv(ROSTER_CSV, index=False, encoding="utf-8")
+
+
 
 
 # PDF → JPG (1re page) pour Archives
@@ -194,6 +242,17 @@ page = st.sidebar.radio("Navigation", NAV_PUBLIC if (IS_PUBLIC or not is_admin()
                         key="nav_main")
 
 
+# --- Helper hauteur auto pour tables ---------------------------------
+def _auto_table_height(df, max_rows_no_scroll: int = 40,
+                       row_px: int = 34, header_px: int = 38, padding_px: int = 16,
+                       min_px: int = 200, max_px: int | None = None) -> int:
+    n = min(len(df), max_rows_no_scroll)
+    h = header_px + padding_px + row_px * max(n, 1)
+    if max_px is not None:
+        h = min(h, max_px)
+    return max(h, min_px)
+
+
 # =============================================================================
 # 1) 🏆 Tableau
 # =============================================================================
@@ -212,7 +271,24 @@ if page == "🏆 Tableau":
     else:
         table = load_latest_master_any()
 
-    show_table(table)
+    # --- Affichage conservant le style + hauteur auto -------------------
+    height = _auto_table_height(table, max_rows_no_scroll=25)  # pas de scroll jusqu'à ~25 lignes
+    try:
+        # Si show_table accepte height (nouvelle signature)
+        show_table(table, height=height)
+    except TypeError:
+        # Back-compat : si show_table(table) n'accepte pas height,
+        # on force une hauteur auto par CSS puis on appelle show_table(table)
+        st.markdown(
+            """
+            <style>
+            /* Forcer l'auto-hauteur du grid quand il y a peu de lignes */
+            div[data-testid="stDataFrame"] div[role="grid"] { height: auto; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        show_table(table)
 
     # Export CSV
     st.download_button("⬇️ Exporter (CSV affiché)",
@@ -252,6 +328,7 @@ if page == "🏆 Tableau":
                 (st.success if ok else st.error)("Publication effectuée ✅" if ok else "Échec publication ❌")
                 st.caption(msg)
         st.caption("Local = écrit les CSV dans data/. GitHub = même chose + push dans ton dépôt public (data/**).")
+
 
 
 # =============================================================================
@@ -466,66 +543,35 @@ elif page == "📚 Archives":
         st.info("Pas d’historique pour le moment.")
     else:
         d = st.date_input("Afficher l’état au", value=date.today())
-        # IMPORTANT : filtre sur la date du tournoi (start_time), pas la date de traitement
         sub = log[log["start_time"].dt.date <= d].copy()
         table = standings_from_log(sub, season_only=False)
         show_table(table, caption=f"État arrêté au {d:%d/%m/%Y}")
 
     # PDFs archivés
     st.subheader("PDFs archivés (par saison)")
-
-    # ✅ Always resolve from helper so public reads data/PDF_Traites and local reads ARCHIVE/PDF_TRAITES
-    from app_classement_unique import get_pdf_archive_dir
-
-    src_dir = get_pdf_archive_dir()
-    # Optional debug hint (only shown in local/admin)
-    try:
-        if not IS_PUBLIC:
-            st.caption(f"Source PDFs: {src_dir.as_posix()}")
-    except NameError:
-        pass
-
-    pdfs = list_files_sorted(src_dir, ("*.pdf",))
+    pdfs = list_files_sorted(PDF_DONE, ("*.pdf",))
     if not pdfs:
         st.caption("Aucun PDF archivé.")
     else:
         with st.expander("Saison courante", expanded=True):
             for p in pdfs:
                 cols = st.columns([6, 2, 2])
-                # name + mtime
-                try:
-                    mt = datetime.fromtimestamp(p.stat().st_mtime)
-                except Exception:
-                    mt = datetime.now()
-                cols[0].write(f"**{p.name}**  \n_{mt:%Y-%m-%d %H:%M}_")
-
-                # PDF download
+                cols[0].write(f"**{p.name}**  \n_{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}_")
                 with cols[1]:
-                    cols[1].download_button(
-                        "Télécharger (PDF)",
-                        data=p.read_bytes(),
-                        file_name=p.name,
-                        type="secondary",
-                        key=f"dlpdf_{p.name}"
-                    )
-
-                # JPG first page (generate to SNAP_DIR/archived_jpg)
+                    st.download_button("Télécharger (PDF)", data=p.read_bytes(),
+                                       file_name=p.name, type="secondary", key=f"dlpdf_{p.name}")
                 with cols[2]:
                     try:
                         jpg_path = SNAP_DIR / "archived_jpg" / (p.stem + ".jpg")
                         need_regen = (not jpg_path.exists()) or (jpg_path.stat().st_mtime < p.stat().st_mtime)
                         if need_regen:
                             pdf_first_page_to_jpg(p, jpg_path, dpi=220)
-                        cols[2].download_button(
-                            "Télécharger (JPG)",
-                            data=jpg_path.read_bytes(),
-                            file_name=jpg_path.name,
-                            type="secondary",
-                            key=f"dljpg_{p.name}"
-                        )
+                        st.download_button("Télécharger (JPG)", data=jpg_path.read_bytes(),
+                                           file_name=jpg_path.name, type="secondary", key=f"dljpg_{p.name}")
                     except Exception as e:
                         st.button("JPG indisponible", disabled=True, key=f"nojpg_{p.name}")
                         st.caption(f"⚠️ Conversion JPG échouée : {e}")
+
 
 # =============================================================================
 # 4) 🏅 Classement par points
@@ -576,9 +622,14 @@ elif page == "🏅 Classement par points":
 elif page == "⬆️ Importer":
     ensure_admin()
     st.title("Importer des résultats (PDF Winamax)")
+    st.session_state.setdefault("pending_tourneys", {})
+    # Import local pour la saisie manuelle (évite d'éditer le header du fichier)
+    from app_classement_unique import build_manual_rows_for_log
+
     if "pending_tourneys" not in st.session_state:
         st.session_state["pending_tourneys"] = {}
 
+    # --- Import PDF classique -------------------------------------------------
     up = st.file_uploader("Déposez un ou plusieurs PDFs", type=["pdf"], accept_multiple_files=True)
     if up and st.button("Analyser et mettre en file", type="primary"):
         logs = []
@@ -597,6 +648,7 @@ elif page == "⬆️ Importer":
                     "src_path": str(tmp),
                     "name": parsed.tournament_name,
                     "start_time": parsed.start_time,
+                    "is_manual": False,
                 }
                 logs.append(f"✅ Ajouté : {f.name} — {len(rows_preview)} ligne(s)")
             except Exception as e:
@@ -606,110 +658,261 @@ elif page == "⬆️ Importer":
             st.text("\n".join(logs))
         st.info("Faites défiler pour valider chaque tournoi.")
 
-    if not st.session_state.pending_tourneys:
-        st.caption("Aucun tournoi en attente de validation.")
-    else:
-        st.subheader("Tournois en attente de validation")
-        to_rerun = False
+# --- Saisie manuelle (NOUVEAU) -------------------------------------------
 
-        for tid, item in list(st.session_state.pending_tourneys.items()):
-            st.markdown(f"**{item['name']} — {pd.to_datetime(item['start_time']):%d/%m/%Y %H:%M}**")
-            edit = st.data_editor(
-                item["df"], num_rows="dynamic", width="stretch", hide_index=True, key=f"edit_{tid}"
-            )
-            bubble_name = compute_bubble_from_rows(edit)
-            st.info(f"**Bulle détectée :** {bubble_name or '(aucune)'}")
+with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
+    t_name = st.text_input("Nom du tournoi", placeholder="Ex. CoronaMax #123")
 
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✅ Valider ce tournoi", key=f"commit_{tid}"):
-                    # 1) Append au log
-                    append_results_log(edit.copy())
+    cdt, cht, cbi = st.columns([2, 1.3, 1.7])
+    with cdt:
+        t_date = st.date_input("Date", value=date.today(), key="manual_date")
+    with cht:
+        t_time = st.time_input("Heure", value=datetime.now().replace(second=0, microsecond=0).time(), key="manual_time")
+    with cbi:
+        t_buyin = st.number_input("Buy-in total (Buy-in + Rake)", min_value=0.0, step=0.5, format="%.2f", key="manual_buyin")
 
-                    # 2) Journal + archivage du PDF
-                    journal = load_journal()
-                    journal.loc[len(journal)] = {
-                        "sha1": tid,
-                        "filename": Path(item["src_path"]).name,
-                        "processed_at": datetime.now(),
-                    }
-                    save_journal(journal)
-                    archive_pdf(Path(item["src_path"]))
-                    del st.session_state.pending_tourneys[tid]
+    # --- Helpers roster (pseudos connus) ---------------------------------
+    def _load_roster() -> list[str]:
+        try:
+            from app_classement_unique import DATA_DIR, load_results_log_any
+            roster_csv = Path(DATA_DIR) / "players_roster.csv"
+            if roster_csv.exists():
+                df = pd.read_csv(roster_csv)
+                pseudos = df.get("Pseudo", pd.Series([], dtype=str)).astype(str).str.strip()
+                return sorted({p for p in pseudos if p}, key=str.casefold)
+            # sinon on dérive du log actuel
+            log = load_results_log_any()
+            pseudos = log.get("Pseudo", pd.Series([], dtype=str)).astype(str).str.strip()
+            return sorted({p for p in pseudos if p}, key=str.casefold)
+        except Exception:
+            return []
 
-                    # 3) Rebuild des snapshots (gains + points + miroirs publics)
-                    from app_classement_unique import (
-                        load_results_log_any,
-                        standings_from_log,
-                        compute_points_table,
-                        current_season_bounds,
-                        DATA_DIR,
+    def _save_roster(pseudos: list[str]) -> None:
+        try:
+            from app_classement_unique import DATA_DIR
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            roster_csv = Path(DATA_DIR) / "players_roster.csv"
+            df = pd.DataFrame({"Pseudo": sorted({p.strip() for p in pseudos if isinstance(p, str) and p.strip()}, key=str.casefold)})
+            df.to_csv(roster_csv, index=False, encoding="utf-8")
+        except Exception as e:
+            print(f"[Importer] WARNING: save roster failed: {e}")
+
+    known_pseudos = _load_roster()
+    assist = st.toggle("Saisie assistée (auto-complétion des pseudos)", value=True, key="manual_assist")
+
+    # Table d'édition des lignes
+    if "manual_rows_df" not in st.session_state:
+        st.session_state.manual_rows_df = pd.DataFrame([
+            {"Position": 1, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
+            {"Position": 2, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
+            {"Position": 3, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
+        ])
+
+    colcfg = {
+        "Position": st.column_config.NumberColumn("Position", step=1, format="%d", help="Place (1,2,3,...)"),
+        "Pseudo": (
+            st.column_config.SelectboxColumn(
+                "Pseudo",
+                options=known_pseudos,
+                help="Tape pour filtrer les pseudos connus"
+            ) if assist else st.column_config.TextColumn("Pseudo", help="Saisie libre")
+        ),
+        "GainsCash": st.column_config.NumberColumn("Gains (€)", format="%.2f", help="Gains cash"),
+        "Bounty": st.column_config.NumberColumn("Bounty (€)", format="%.2f"),
+        "Reentry": st.column_config.NumberColumn("Recaves", step=1, format="%d"),
+    }
+
+    manual_edit = st.data_editor(
+        st.session_state.manual_rows_df,
+        num_rows="dynamic",
+        width="stretch",
+        hide_index=True,
+        key="manual_editor",
+        column_config=colcfg,
+    )
+
+    # Aperçu bulle
+    try:
+        _bubble = compute_bubble_from_rows(manual_edit)
+        st.caption(f"Bulle détectée : **{_bubble or '(aucune)'}**")
+    except Exception:
+        pass
+
+    # Mise en file
+    if st.button("➕ Mettre en file (saisie manuelle)", type="primary", key="manual_queue"):
+        if not t_name.strip():
+            st.warning("Renseigne d'abord le nom du tournoi.")
+        else:
+            dt = datetime.combine(t_date, t_time)
+            df_manual = build_manual_rows_for_log(t_name.strip(), dt, float(t_buyin), manual_edit.copy())
+            # filtre sécurité : au moins 1 pseudo non vide
+            has_rows = (df_manual["Pseudo"].astype(str).str.strip() != "").any()
+            if not has_rows:
+                st.warning("Ajoute au moins une ligne avec un pseudo.")
+            else:
+                # Mettre à jour le roster dès maintenant (optionnel mais pratique)
+                try:
+                    new_pseudos = df_manual["Pseudo"].astype(str).str.strip().tolist()
+                    merged = sorted(set(known_pseudos) | {p for p in new_pseudos if p}, key=str.casefold)
+                    _save_roster(merged)
+                except Exception as e:
+                    print(f"[Importer] WARNING: roster update failed: {e}")
+
+                tid = str(df_manual["tournament_id"].iloc[0])
+                st.session_state.pending_tourneys[tid] = {
+                    "df": df_manual,
+                    "src_path": "",  # pas de PDF
+                    "name": t_name.strip(),
+                    "start_time": dt,
+                    "is_manual": True,
+                }
+                st.success(f"✅ Ajouté : {t_name.strip()} — {len(df_manual)} ligne(s)")
+
+
+
+# --- File d'attente / Validation -----------------------------------------
+if not st.session_state.get("pending_tourneys"):
+    st.caption("Aucun tournoi en attente de validation.")
+else:
+    st.subheader("Tournois en attente de validation")
+    to_rerun = False
+
+    for tid, item in list(st.session_state.get("pending_tourneys", {}).items()):
+        st.markdown(f"**{item['name']} — {pd.to_datetime(item['start_time']):%d/%m/%Y %H:%M}**")
+        edit = st.data_editor(
+            item["df"], num_rows="dynamic", width="stretch", hide_index=True, key=f"edit_{tid}"
+        )
+        bubble_name = compute_bubble_from_rows(edit)
+        st.info(f"**Bulle détectée :** {bubble_name or '(aucune)'}")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ Valider ce tournoi", key=f"commit_{tid}"):
+                # 1) Append au log
+                append_results_log(edit.copy())
+                
+                try:
+                    new_pseudos = (
+                        edit.get("Pseudo")
+                            .astype(str).str.strip()
+                            .dropna().tolist()
                     )
+                    merged = sorted(set(load_roster()) | {p for p in new_pseudos if p}, key=str.casefold)
+                    save_roster(merged)
+                except Exception as e:
+                    print(f"[Importer] WARNING: roster update failed: {e}")
+                    
+                # 2) Journal + archivage conditionnels (robuste)
+                journal = load_journal()
 
-                    cur_log = load_results_log_any()
-                    table_gains = standings_from_log(cur_log, season_only=False)
+                # srcp peut être None si saisie manuelle ou si la génération PDF échoue
+                srcp = Path(item.get("src_path")) if item.get("src_path") else None
 
-                    # Points sur la saison courante
-                    s0, s1 = current_season_bounds()
-                    table_points = compute_points_table(cur_log, d1=s0, d2=s1)
-
-                    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-                    # Gains
-                    (DATA_DIR / "latest_master.csv").write_text(
-                        table_gains.to_csv(index=False), encoding="utf-8"
-                    )
-                    # Points (saison en cours)
-                    (DATA_DIR / "points_table.csv").write_text(
-                        table_points.to_csv(index=False), encoding="utf-8"
-                    )
-                    # Journal public
-                    (DATA_DIR / "journal.csv").write_text(
-                        journal.to_csv(index=False), encoding="utf-8"
-                    )
-                    # Miroir du results_log (utile si append_results_log ne le fait pas déjà)
+                # ➕ Si pas de PDF (saisie manuelle), on génère un PDF temporaire dans PDF_DIR
+                if (srcp is None) or (not srcp.is_file()):
                     try:
-                        (DATA_DIR / "results_log.csv").write_text(
-                            cur_log.to_csv(index=False), encoding="utf-8"
+                        from app_classement_unique import render_manual_results_pdf
+                        srcp = render_manual_results_pdf(
+                            edit.copy(),
+                            item["name"],
+                            pd.to_datetime(item["start_time"])
                         )
                     except Exception as e:
-                        print(f"[Importer] WARNING: miroir data/results_log.csv KO: {e}")
+                        print(f"[Importer] render_manual_results_pdf KO: {e}")
+                        srcp = None  # ❗️ surtout pas Path("")
 
-                    # 4) Diagnostics
-                    st.caption(f"📄 ARCHIVE/results_log.csv → {len(cur_log)} lignes")
-                    st.caption(f"🧮 latest_master.csv: {len(table_gains)} lignes")
-                    st.caption(f"🏅 points_table.csv: {len(table_points)} lignes")
+                filename = srcp.name if (srcp and srcp.is_file()) else f"(saisie manuelle) {item['name']}"
+                journal.loc[len(journal)] = {
+                    "sha1": tid,
+                    "filename": filename,
+                    "processed_at": datetime.now(),
+                }
+                save_journal(journal)
 
-                    st.success("Tournoi ajouté. Classement mis à jour.")
-                    to_rerun = True
+                if srcp and srcp.is_file():
+                    archive_pdf(srcp)
 
-            with c2:
-                if st.button("🗑️ Annuler / retirer de la file", key=f"cancel_{tid}"):
-                    safe_unlink(Path(item["src_path"]))
-                    del st.session_state.pending_tourneys[tid]
-                    st.warning("Tournoi retiré de la file.")
-                    to_rerun = True
+                # retirer de la file
+                del st.session_state["pending_tourneys"][tid]
 
-            st.divider()
+                # 3) Rebuild des snapshots (gains + points + miroirs publics)
+                from app_classement_unique import (
+                    load_results_log_any,
+                    standings_from_log,
+                    compute_points_table,
+                    current_season_bounds,
+                    DATA_DIR,
+                )
 
-        if to_rerun:
+                cur_log = load_results_log_any()
+                table_gains = standings_from_log(cur_log, season_only=False)
+
+                # Points sur la saison courante
+                s0, s1 = current_season_bounds()
+                table_points = compute_points_table(cur_log, d1=s0, d2=s1)
+
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+                # Gains
+                (DATA_DIR / "latest_master.csv").write_text(
+                    table_gains.to_csv(index=False), encoding="utf-8"
+                )
+                # Points (saison en cours)
+                (DATA_DIR / "points_table.csv").write_text(
+                    table_points.to_csv(index=False), encoding="utf-8"
+                )
+                # Journal public
+                (DATA_DIR / "journal.csv").write_text(
+                    journal.to_csv(index=False), encoding="utf-8"
+                )
+                # Miroir du results_log (utile si append_results_log ne le fait pas déjà)
+                try:
+                    (DATA_DIR / "results_log.csv").write_text(
+                        cur_log.to_csv(index=False), encoding="utf-8"
+                    )
+                except Exception as e:
+                    print(f"[Importer] WARNING: miroir data/results_log.csv KO: {e}")
+
+                # 4) Diagnostics
+                st.caption(f"📄 ARCHIVE/results_log.csv → {len(cur_log)} lignes")
+                st.caption(f"🧮 latest_master.csv: {len(table_gains)} lignes")
+                st.caption(f"🏅 points_table.csv: {len(table_points)} lignes")
+
+                st.success("Tournoi ajouté. Classement mis à jour.")
+                to_rerun = True
+
+        with c2:
+            if st.button("🗑️ Annuler / retirer de la file", key=f"cancel_{tid}"):
+                srcp = Path(item.get("src_path")) if item.get("src_path") else None
+                if srcp and srcp.is_file():
+                    safe_unlink(srcp)
+                # protéger l'accès même si clé absente
+                pend = st.session_state.get("pending_tourneys", {})
+                if tid in pend:
+                    del pend[tid]
+                st.warning("Tournoi retiré de la file.")
+                to_rerun = True
+
+        st.divider()
+
+    if to_rerun:
+        st.rerun()
+
+    # Rollback
+    st.subheader("Annuler le dernier import")
+    if st.button("🧹 Annuler le dernier tournoi importé"):
+        info = rollback_last_import()
+        if info.get("ok"):
+            st.success(f"{info['msg']} — PDF remis: {info.get('pdf_back','')}")
             st.rerun()
-
-        # Rollback
-        st.subheader("Annuler le dernier import")
-        if st.button("🧹 Annuler le dernier tournoi importé"):
-            info = rollback_last_import()
-            if info.get("ok"):
-                st.success(f"{info['msg']} — PDF remis: {info.get('pdf_back','')}")
-                st.rerun()
-            else:
-                st.info(info.get("msg", "Rien à annuler."))
+        else:
+            st.info(info.get("msg", "Rien à annuler."))
 
 
 # =============================================================================
 # 6) ♻️ Réinitialiser (ADMIN)
 # =============================================================================
-elif page == "♻️ Réinitialiser":
+if page == "♻️ Réinitialiser":
     ensure_admin()
     st.title("Réinitialiser la saison courante")
     st.warning("Attention : remise à zéro des agrégats. Les PDFs archivés peuvent être re-traités ensuite.")

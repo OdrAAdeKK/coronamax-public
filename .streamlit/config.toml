@@ -5,3 +5,12 @@ secondaryBackgroundColor="#1b1f2a"
 textColor="#e6e6e6"
 font="sans serif"
 
+[server]
+port = 8501
+headless = false
+address = "localhost"
+runOnSave = false
+
+[browser]
+serverAddress = "localhost"
+gatherUsageStats = false

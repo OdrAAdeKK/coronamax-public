@@ -75,46 +75,6 @@ for d in (ARCHIVE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR):
 IS_PUBLIC = os.getenv("CMX_MODE", "local").lower() == "public"
 
 
-# --- add these aliases (keep your existing constants) ---
-PDF_DONE_LOCAL = ARCHIVE / "PDF_TRAITES"      # local archive (existing)
-DATA_PDF_TRAITES = DATA_DIR / "PDF_Traites"   # public snapshot location
-
-# after BASE / ARCHIVE / DATA_DIR / PDF_DONE etc.
-def get_pdf_archive_dir() -> Path:
-    """Return the directory that contains archived tournament PDFs."""
-    is_public = bool(globals().get("IS_PUBLIC",
-                     os.getenv("CMX_MODE", "local").lower() == "public"))
-
-    candidates: list[Path] = []
-    if is_public:
-        candidates += [
-            DATA_DIR / "PDF_Traites",   # canonical in /data
-            DATA_DIR / "PDF_TRAITES",   # tolerate other casing
-            ARCHIVE / "PDF_TRAITES",    # fallback if present
-        ]
-    else:
-        candidates += [
-            PDF_DONE,                    # ARCHIVE/PDF_TRAITES
-            ARCHIVE / "PDF_TRAITES",
-            DATA_DIR / "PDF_Traites",
-        ]
-
-    for p in candidates:
-        if p.exists():
-            try:
-                if any(p.glob("*.pdf")):
-                    return p
-            except Exception:
-                pass
-
-    target = candidates[0]
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    return target
-
-
 def _normalize_repo_url(repo_url: str) -> str:
     """
     Accepte:
@@ -510,6 +470,195 @@ def build_rows_for_log(parsed: ParsedTournament) -> pd.DataFrame:
     d = d[["tournament_id","tournament_name","start_time","processed_at",
            "Pseudo","Position","GainsCash","Bounty","Reentry","buyin_total"]]
     return _normalize_results_log(d)
+
+
+
+from typing import Any  # si pas déjà importé en haut
+
+
+def build_manual_rows_for_log(
+    tournament_name: str,
+    start_time: datetime,
+    buyin_total: float,
+    rows: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Construit les lignes normalisées pour un tournoi saisi à la main
+    (même schéma que `build_rows_for_log`).
+
+    Colonnes attendues dans `rows` (insensibles à la casse/alias) :
+      - Position (int)
+      - Pseudo (str)
+      - GainsCash (float ou "12,34 €")
+      - Bounty (float ou "12,34 €") [optionnel]
+      - Reentry (int) [optionnel]
+
+    Le `tournament_id` est un SHA1 déterministe basé sur (nom, date/heure, buy-in, contenu des lignes).
+    """
+    d = rows.copy() if rows is not None else pd.DataFrame()
+
+    # Harmonise/complète les colonnes
+    alias = {
+        "gaincash": "GainsCash",
+        "gains": "GainsCash",
+        "bounty": "Bounty",
+        "re-entry": "Reentry",
+        "reentry": "Reentry",
+        "place": "Position",
+        "rank": "Position",
+        "pseudo": "Pseudo",
+    }
+    cols = {c: alias.get(str(c).strip().lower(), c) for c in d.columns}
+    d = d.rename(columns=cols)
+    for c in ["Position", "Pseudo", "GainsCash", "Bounty", "Reentry"]:
+        if c not in d.columns:
+            d[c] = 0 if c in ("Position", "Reentry", "GainsCash", "Bounty") else ""
+
+    # Typage/normalisation basique
+    d["Position"] = pd.to_numeric(d["Position"], errors="coerce").fillna(0).astype(int)
+    d["Reentry"]  = pd.to_numeric(d["Reentry"],  errors="coerce").fillna(0).astype(int)
+    d["GainsCash"] = d["GainsCash"].apply(parse_money).astype(float)
+    d["Bounty"]    = d["Bounty"].apply(parse_money).astype(float)
+    d["Pseudo"]    = d["Pseudo"].astype(str)
+
+    # Supprime les lignes vides (sans pseudo et sans chiffres)
+    d = d[~(d["Pseudo"].str.strip() == "")].copy()
+    if d.empty:
+        # crée une ligne factice pour éviter d'écrire un log vide
+        d = pd.DataFrame([{"Position": 0, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0}])
+
+    # ID déterministe (manuel)
+    # On inclut une version compacte des lignes dans le hash pour éviter les collisions
+    try:
+        compact_rows = d[["Position", "Pseudo", "GainsCash", "Bounty", "Reentry"]].astype(str)
+        compact = ";".join(
+            compact_rows.apply(lambda r: ",".join(r.values.tolist()), axis=1).tolist()
+        )
+    except Exception:
+        compact = f"{len(d)} lignes"
+
+    src = (
+        f"[MANUAL]|{tournament_name}|{start_time.isoformat()}|{float(buyin_total):.2f}|{compact}"
+    ).encode("utf-8")
+    tournament_id = hashlib.sha1(src).hexdigest()
+
+    # Compose le DataFrame final (schéma RESULTS_LOG)
+    d["tournament_id"]   = tournament_id
+    d["tournament_name"] = str(tournament_name)
+    d["start_time"]      = start_time
+    d["processed_at"]    = datetime.now()
+    d["buyin_total"]     = float(buyin_total)
+
+    d = d[[
+        "tournament_id", "tournament_name", "start_time", "processed_at",
+        "Pseudo", "Position", "GainsCash", "Bounty", "Reentry", "buyin_total"
+    ]]
+
+    # Normalisation finale (types/ordre) comme le reste de l'app
+    return _normalize_results_log(d)
+
+
+from typing import Optional
+
+def render_manual_results_pdf(
+    rows: pd.DataFrame,
+    tournament_name: str,
+    start_time: datetime,
+    out_dir: Optional[Path] = None,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    out_dir = out_dir or PDF_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Nettoyage / sélection des colonnes utiles
+    d = rows.copy()
+    if "Pseudo" in d.columns:
+        d = d[d["Pseudo"].astype(str).str.strip() != ""].copy()
+    if "Position" in d.columns:
+        d["Position"] = pd.to_numeric(d["Position"], errors="coerce").fillna(0).astype(int)
+        d = d.sort_values(["Position", "Pseudo"], ascending=[True, True])
+
+    # Colonnes à afficher
+    shown_cols = ["Position", "Pseudo", "GainsCash"]
+    if "Bounty" in d.columns and (d["Bounty"].fillna(0) != 0).any():
+        shown_cols.append("Bounty")
+    if "Reentry" in d.columns and (d["Reentry"].fillna(0) != 0).any():
+        shown_cols.append("Reentry")
+    d2 = d[[c for c in shown_cols if c in d.columns]].copy()
+
+    # Mise en forme €
+    if "GainsCash" in d2.columns:
+        d2["GainsCash"] = d2["GainsCash"].apply(parse_money).apply(euro)
+    if "Bounty" in d2.columns:
+        d2["Bounty"] = d2["Bounty"].apply(parse_money).apply(euro)
+
+    # Métadonnées
+    try:
+        buyin = float(rows.get("buyin_total", pd.Series([0.0])).iloc[0])
+    except Exception:
+        buyin = 0.0
+    dt_str = pd.to_datetime(start_time).strftime("%d/%m/%Y %H:%M")
+
+    # Filename (PDF_DIR)
+    fname_base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(tournament_name).strip()) or "tournoi"
+    fname = f"{fname_base}__{pd.to_datetime(start_time):%Y%m%d_%H%M}.pdf"
+    out_path = out_dir / fname
+
+    # === Rendu Matplotlib (A4 portrait) ===
+    fig = plt.figure(figsize=(8.27, 11.69), dpi=220)
+    ax = fig.add_axes([0.05, 0.05, 0.90, 0.90])
+    ax.axis("off")
+
+    # Titre & sous-titre
+    fig.text(0.5, 0.965, f"CoronaMax — {tournament_name}", ha="center", va="top", fontsize=18, fontweight="bold")
+    fig.text(0.5, 0.935, f"{dt_str}  •  Saisie manuelle  •  Buy-in total: {euro(buyin)}",
+             ha="center", va="top", fontsize=11)
+
+    # Tableau
+    headers = list(d2.columns)
+    table_data = [headers] + d2.astype(str).values.tolist()
+
+    # dimensions instanciées sur une zone dédiée
+    tab_ax = fig.add_axes([0.05, 0.12, 0.90, 0.78])
+    tab_ax.axis("off")
+
+    table = tab_ax.table(cellText=table_data, loc='upper center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+
+    # Largeur colonnes (Pseudo plus large)
+    ncol = len(headers)
+    for j in range(ncol):
+        w = 0.5 if headers[j].lower() == "pseudo" else 0.18
+        table.auto_set_column_width(j)
+        table._cells[(0, j)].set_facecolor("#f7b329")
+        table._cells[(0, j)].set_text_props(color="#000000", weight="bold")
+        for i in range(len(table_data)):
+            c = table._cells.get((i, j))
+            if c:
+                c.set_height(0.028)
+                if headers[j].lower() == "pseudo":
+                    c.set_width(0.58)
+                else:
+                    c.set_width(0.20)
+
+    # Pied de page
+    fig.text(0.5, 0.065, "Document généré automatiquement à partir d'une saisie manuelle",
+             ha="center", va="center", fontsize=8, alpha=0.75)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, bbox_inches="tight", pad_inches=0.5)
+    plt.close(fig)
+
+    return out_path
+
+
+
+
+
+
+
 
 
 # =============================================================================
@@ -936,7 +1085,6 @@ def rollback_last_import() -> dict:
 # Publication snapshot (local + push Git)
 # =============================================================================
 
-
 def _build_public_snapshot_files() -> dict[str, bytes]:
     log = load_results_log_any()
     journal = load_journal_any()
@@ -1031,37 +1179,6 @@ def _ensure_pub_repo(repo_url: str, token: str, branch: str, repo_dir: Path) -> 
         return True, "prepare: repo prêt"
 
 
-def _copy_archived_pdfs_to_snapshot() -> int:
-    """Copie tous les PDFs archivés vers data/PDF_Traites/ (écrase si plus récent/ différent).
-    Retourne le nombre de PDFs copiés."""
-    outdir = DATA_DIR / "PDF_Traites"
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # On tolère les deux graphies possibles et on déduplique
-    candidate_dirs = []
-    for d in {ARCHIVE / "PDF_TRAITES", ARCHIVE / "PDF_Traites"}:
-        if d.exists() and d.is_dir():
-            candidate_dirs.append(d)
-
-    count = 0
-    for base in candidate_dirs:
-        for p in base.rglob("*.pdf"):
-            try:
-                dst = outdir / p.name
-                # Copie seulement si le dst n'existe pas ou différent (taille/mtime)
-                need = (
-                    (not dst.exists()) or
-                    (p.stat().st_mtime > dst.stat().st_mtime) or
-                    (p.stat().st_size != dst.stat().st_size)
-                )
-                if need:
-                    shutil.copy2(p, dst)
-                count += 1
-            except Exception as e:
-                print(f"[snapshot] copy PDF failed {p}: {e}")
-    return count
-
-
 
 
 def publish_public_snapshot(push_to_github: bool = False, message: str = "CoronaMax: snapshot") -> tuple[bool, str]:
@@ -1072,20 +1189,15 @@ def publish_public_snapshot(push_to_github: bool = False, message: str = "Corona
     """
     files = _build_public_snapshot_files()
 
-    # Écriture locale (toujours)
+    # --- Écriture locale (toujours)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     for name, blob in files.items():
         path = DATA_DIR / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(blob)
 
-    # 👉 NOUVEAU : inclure aussi les PDFs archivés dans le snapshot local
-    pdf_copied = _copy_archived_pdfs_to_snapshot()
-
-
     if not push_to_github:
-        return True, f"Snapshot locale générée (CSV) + {pdf_copied} PDF(s) copiés dans data/PDF_Traites/."
-
+        return True, "Snapshot locale générée (aucun push GitHub demandé)."
 
     repo_url = os.getenv("GIT_PUBLIC_REPO", "").strip()
     token    = os.getenv("GIT_TOKEN", "").strip()
