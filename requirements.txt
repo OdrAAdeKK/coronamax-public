@@ -1,9 +1,8 @@
-streamlit>=1.39
-pandas>=2.2
-numpy>=1.26
-altair>=5.3
-pdfplumber>=0.11
-pillow>=10.4
-matplotlib>=3.9
-pymupdf>=1.23
-requests
+streamlit==1.39.0
+pandas==2.2.2
+numpy==1.26.4
+altair==5.1.2
+Pillow==10.4.0
+matplotlib==3.8.4
+pdfplumber==0.11.0
+PyPDF2==3.0.1
