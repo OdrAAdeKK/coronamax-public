@@ -761,11 +761,12 @@ with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
     manual_edit = st.data_editor(
         st.session_state.manual_rows_df,
         num_rows="dynamic",
-        width="stretch",
+        use_container_width=True,   # ✅ à la place de width="stretch"
         hide_index=True,
         key="manual_editor",
         column_config=colcfg,
     )
+
 
     # Aperçu bulle
     try:
@@ -816,8 +817,13 @@ else:
     for tid, item in list(st.session_state.get("pending_tourneys", {}).items()):
         st.markdown(f"**{item['name']} — {pd.to_datetime(item['start_time']):%d/%m/%Y %H:%M}**")
         edit = st.data_editor(
-            item["df"], num_rows="dynamic", width="stretch", hide_index=True, key=f"edit_{tid}"
+            item["df"],
+            num_rows="dynamic",
+            use_container_width=True,   # ✅ ici aussi
+            hide_index=True,
+            key=f"edit_{tid}",
         )
+
         bubble_name = compute_bubble_from_rows(edit)
         st.info(f"**Bulle détectée :** {bubble_name or '(aucune)'}")
 
