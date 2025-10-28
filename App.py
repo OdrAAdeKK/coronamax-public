@@ -1,21 +1,24 @@
-# App.py — wrapper de démarrage robuste (ne touche pas à ton code métier)
+# App.py — wrapper robuste qui affiche toute erreur de boot
 
 import streamlit as st
 
-# Important : config très tôt (sinon pas de page si ça crashe)
-st.set_page_config(page_title="CoronaMax", page_icon="🂡", layout="wide")
-st.write("")  # force un premier rendu
+# On essaye la config très tôt, mais on ignore si elle est déjà faite dans app_core
+try:
+    st.set_page_config(page_title="CoronaMax", page_icon="🂡", layout="wide")
+except Exception:
+    pass
+
+st.write("")  # force un premier rendu pour éviter l'écran vide
 
 try:
-    # ⚠️ Ton VRAI code vit maintenant dans app_core.py
-    import app_core  # exécute tout le code existant (ex-App.py)
+    # ⚠️ Ton vrai code (celui d'avant) doit vivre dans app_core.py
+    import app_core  # exécute tout ton code existant
 except Exception as e:
     st.error("🚨 Erreur au démarrage de l’application (trace détaillée ci-dessous)")
     st.exception(e)
-    # journalisation simple pour post-mortem
     try:
         from pathlib import Path
-        Path("boot_error.log").write_text(str(e))
+        Path("boot_error.log").write_text(repr(e))
     except Exception:
         pass
     st.stop()
