@@ -573,95 +573,47 @@ elif page == "👤 Détails joueur":
 
 
 # =============================================================================
-# 3) 🗃️ Archives (robuste)
+# 3) 📚 Archives
 # =============================================================================
-elif page == "🗃️ Archives":
-    try:
-        st.title("Archives")
+elif page == "📚 Archives":
+    st.title("Archives")
 
-        # Classement “à la date” (basé sur la DATE DE TOURNOI)
-        st.subheader("Classement « à la date »")
-        log = load_results_log_any()
+    # Classement “à la date” (basé sur la DATE DE TOURNOI)
+    st.subheader("Classement « à la date »")
+    log = load_results_log_any()
+    if log.empty:
+        st.info("Pas d’historique pour le moment.")
+    else:
+        d = st.date_input("Afficher l’état au", value=date.today())
+        sub = log[log["start_time"].dt.date <= d].copy()
+        table = standings_from_log(sub, season_only=False)
+        show_table(table, caption=f"État arrêté au {d:%d/%m/%Y}")
 
-        if log is None or log.empty:
-            st.info("Pas d’historique pour le moment.")
-        else:
-            # -> sécu: forcer une vraie date exploitable, ignorer lignes sans date
-            if "start_time" in log.columns:
-                log["start_date"] = pd.to_datetime(log["start_time"], errors="coerce").dt.date
-                log = log.dropna(subset=["start_date"])
-                if log.empty:
-                    st.info("Aucune date exploitable dans l’historique.")
-                    sub = pd.DataFrame()
-                    d = date.today()
-                else:
-                    d = st.date_input("Afficher l’état au", value=date.today())
-                    sub = log[log["start_date"] <= d].copy()
-            else:
-                st.warning("Colonne `start_time` absente : affichage du classement global actuel.")
-                sub = log.copy()
-                d = None  # pas d’état daté
+    # PDFs archivés
+    st.subheader("PDFs archivés (par saison)")
+    pdfs = list_files_sorted(PDF_DONE, ("*.pdf",))
+    if not pdfs:
+        st.caption("Aucun PDF archivé.")
+    else:
+        with st.expander("Saison courante", expanded=True):
+            for p in pdfs:
+                cols = st.columns([6, 2, 2])
+                cols[0].write(f"**{p.name}**  \n_{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}_")
+                with cols[1]:
+                    st.download_button("Télécharger (PDF)", data=p.read_bytes(),
+                                       file_name=p.name, type="secondary", key=f"dlpdf_{p.name}")
+                with cols[2]:
+                    try:
+                        jpg_path = SNAP_DIR / "archived_jpg" / (p.stem + ".jpg")
+                        need_regen = (not jpg_path.exists()) or (jpg_path.stat().st_mtime < p.stat().st_mtime)
+                        if need_regen:
+                            pdf_first_page_to_jpg(p, jpg_path, dpi=220)
+                        st.download_button("Télécharger (JPG)", data=jpg_path.read_bytes(),
+                                           file_name=jpg_path.name, type="secondary", key=f"dljpg_{p.name}")
+                    except Exception as e:
+                        st.button("JPG indisponible", disabled=True, key=f"nojpg_{p.name}")
+                        st.caption(f"⚠️ Conversion JPG échouée : {e}")
 
-            if sub is None or sub.empty:
-                st.info("Aucune donnée à cette date.")
-            else:
-                table = standings_from_log(sub, season_only=False)
-                cap = f"État arrêté au {d:%d/%m/%Y}" if d else None
-                try:
-                    show_table(table, caption=cap)
-                except TypeError:
-                    # compat anciennes signatures
-                    st.dataframe(table, use_container_width=True, hide_index=True)
-                    if cap:
-                        st.caption(cap)
-
-        # PDFs archivés (avec garde-fous)
-        st.subheader("PDFs archivés (par saison)")
-        try:
-            pdfs = list_files_sorted(PDF_DONE, ("*.pdf",)) if PDF_DONE.exists() else []
-        except Exception:
-            pdfs = []
-
-        if not pdfs:
-            st.caption("Aucun PDF archivé.")
-        else:
-            with st.expander("Saison courante", expanded=True):
-                for p in pdfs:
-                    cols = st.columns([6, 2, 2])
-                    cols[0].write(
-                        f"**{p.name}**  \n_{datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}_"
-                    )
-                    # Téléchargement PDF
-                    with cols[1]:
-                        try:
-                            cols[1].download_button(
-                                "Télécharger (PDF)", data=p.read_bytes(),
-                                file_name=p.name, type="secondary", key=f"dlpdf_{p.name}"
-                            )
-                        except Exception:
-                            st.button("PDF indisponible", disabled=True, key=f"no_pdf_{p.name}")
-
-                    # Téléchargement JPG (1re page) – best-effort
-                    with cols[2]:
-                        try:
-                            jpg_path = SNAP_DIR / "archived_jpg" / (p.stem + ".jpg")
-                            need_regen = (not jpg_path.exists()) or (jpg_path.stat().st_mtime < p.stat().st_mtime)
-                            if need_regen:
-                                pdf_first_page_to_jpg(p, jpg_path, dpi=220)
-                            cols[2].download_button(
-                                "Télécharger (JPG)", data=jpg_path.read_bytes(),
-                                file_name=jpg_path.name, type="secondary", key=f"dljpg_{p.name}"
-                            )
-                        except Exception as e:
-                            st.button("JPG indisponible", disabled=True, key=f"nojpg_{p.name}")
-                            st.caption(f"⚠️ Conversion JPG échouée : {e}")
-
-    except Exception as e:
-        st.error("Erreur dans **Archives**.")
-        st.exception(e)
-        if st.button("⬅️ Revenir au tableau"):
-            st.session_state["nav_main"] = "🏆 Tableau"
-            st.rerun()
 
 # =============================================================================
 # 4) 🏅 Classement par points
