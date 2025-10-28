@@ -12,7 +12,32 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from app_classement_unique import standings_from_log
+from app_classement_unique import (
+    # Dossiers / chemins / constantes
+    BASE, ARCHIVE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR,
+    RESULTS_LOG, JOURNAL_CSV,
+    RESULTS_LOG_COLUMNS, JOURNAL_COLUMNS,
+
+    # Outils format / calculs
+    parse_money, euro, current_season_bounds,
+
+    # Chargement / sauvegarde données
+    load_results_log_any, load_latest_master_any,
+    load_journal, save_journal, append_results_log,
+
+    # Parsing & construction depuis PDF / manuel
+    extract_from_pdf, build_rows_for_log, build_manual_rows_for_log, render_manual_results_pdf,
+
+    # Classements / points / bulles
+    standings_from_log, compute_points_table, compute_bubble_from_rows,
+
+    # Exports
+    classement_df_to_jpg, classement_points_df_to_jpg,
+
+    # Archivage / rollback / publication
+    archive_pdf, rollback_last_import, publish_public_snapshot, safe_unlink,
+)
+
 
 
 # ---- Streamlit page config: exactly once, and as the first Streamlit call
