@@ -372,198 +372,204 @@ if page == "🏆 Tableau":
 # =============================================================================
 
 elif page == "👤 Détails joueur":
-    import pandas as pd
-    import numpy as np
-    import altair as alt
-    from datetime import date
-    from app_classement_unique import (
-        current_season_bounds, euro, parse_money, load_results_log_any
-    )
-
-    st.title("Fiche joueur")
-
-    log = load_results_log_any()
-    if log is None or log.empty:
-        st.info("Aucun historique pour l’instant.")
-        st.stop()
-
-    # --------- Helpers robustes (colonnes variables) ----------
-    def _pick_series(df: pd.DataFrame, candidates: list[str], default):
-        for c in candidates:
-            if c in df.columns:
-                return df[c]
-        return pd.Series([default] * len(df), index=df.index)
-
-    # borne par saison (défaut = saison courante)
-    s0, s1 = current_season_bounds()
-    with st.expander("Filtrer par période (saison active par défaut)", expanded=False):
-        d1 = st.date_input("Du", value=s0)
-        d2 = st.date_input("Au", value=s1)
-
-    # choix du joueur (sans Winamax)
-    pseudos = sorted([p for p in log["Pseudo"].dropna().unique().tolist()
-                      if str(p).strip().lower() != "winamax"])
-    if not pseudos:
-        st.info("Aucun joueur trouvé.")
-        st.stop()
-    who = st.selectbox("Choisir un joueur", pseudos)
-
-    # sous-ensemble période + joueur
-    df = log.copy()
-    if "start_time" in df.columns and not df["start_time"].isna().all():
-        df["start_date"] = pd.to_datetime(df["start_time"]).dt.date
-        df = df[(df["start_date"] >= d1) & (df["start_date"] <= d2)]
-    df = df[df["Pseudo"] == who].copy()
-    if df.empty:
-        st.info("Pas de données pour ce joueur sur la période.")
-        st.stop()
-
-    # Colonnes clefs robustes
-    pos      = pd.to_numeric(_pick_series(df, ["Position", "Place", "Rank"], 0), errors="coerce").fillna(0).astype(int)
-    gaincash = _pick_series(df, ["GainsCash", "GainCash", "Gains"], 0.0).apply(parse_money).fillna(0.0)
-    bounty   = _pick_series(df, ["Bounty"], 0.0).apply(parse_money).fillna(0.0)
-    reentry  = pd.to_numeric(_pick_series(df, ["Reentry", "Re-entry"], 0), errors="coerce").fillna(0).astype(int)
-    buyin_t  = _pick_series(df, ["buyin_total", "buy_in_total", "Buy in total"], 0.0).apply(parse_money).fillna(0.0)
-    t_id     = _pick_series(df, ["tournament_id"], "").astype(str)
-    t_name   = _pick_series(df, ["tournament_name"], "").astype(str)
-    start_ts = pd.to_datetime(_pick_series(df, ["start_time"], pd.NaT), errors="coerce")
-
-    # ITM (cash hors bounty)
-    itm_flag = (gaincash > 0).astype(int)
-    # Victoires
-    win_flag = (pos == 1).astype(int)
-
-    # -------- Bulles (corrigé) : calculées sur le log complet, puis on regarde si 'who' est le 1er non-payé
-    def bubble_map(full_log: pd.DataFrame) -> dict:
-        if full_log.empty:
-            return {}
-        L = {}
-        g = full_log.copy()
-        g["gc"] = _pick_series(g, ["GainsCash", "GainCash", "Gains"], 0.0).apply(parse_money).fillna(0.0)
-        g["pos"] = pd.to_numeric(_pick_series(g, ["Position", "Place", "Rank"], 0), errors="coerce").fillna(0).astype(int)
-        for tid, grp in g.groupby(_pick_series(g, ["tournament_id"], "").astype(str)):
-            grp = grp.sort_values("pos")
-            no_paid = grp[grp["gc"] <= 0.0]
-            if no_paid.empty:
-                continue
-            L[tid] = str(no_paid.iloc[0]["Pseudo"])
-        return L
-
-    bubbles_by_tid = bubble_map(log)
-    bubble_flag = t_id.map(lambda tid: 1 if bubbles_by_tid.get(tid) == who else 0)
-
-    # Recaves € / Frais / Gains totaux / Bénéfices
-    recaves_euro = reentry * buyin_t
-    frais = buyin_t + recaves_euro
-    gains_tot = gaincash + bounty
-    benef = gains_tot - frais
-
-    # ---- Agrégats
-    parties    = int(len(df))
-    wins       = int(win_flag.sum())
-    itm        = int(itm_flag.sum())
-    pct_itm    = (itm / parties) * 100 if parties else 0.0
-    bulles     = int(bubble_flag.sum())
-    recaves_nb = int(reentry.sum())
-    recaves_e  = float(recaves_euro.sum())
-    buyins     = float(buyin_t.sum())
-    total_fees = float(frais.sum())
-    g_cash     = float(gaincash.sum())
-    g_bounty   = float(bounty.sum())
-    g_total    = float(gains_tot.sum())
-    net        = float(benef.sum())
-    roi_total  = (g_total - total_fees) / total_fees if total_fees > 0 else 0.0  # ROI sur gains totaux uniquement
-    avg_finish = float(pos.replace(0, np.nan).mean()) if (pos > 0).any() else 0.0
-
-    # Points (formule N_participants - pos + 1, min=1) sur la période
-    log_period = log.copy()
-    if "start_time" in log_period.columns and not log_period["start_time"].isna().all():
-        log_period["start_date"] = pd.to_datetime(log_period["start_time"]).dt.date
-        log_period = log_period[(log_period["start_date"] >= d1) & (log_period["start_date"] <= d2)]
-    lp_pos   = pd.to_numeric(_pick_series(log_period, ["Position", "Place", "Rank"], 0), errors="coerce").fillna(0).astype(int)
-    lp_tid   = _pick_series(log_period, ["tournament_id"], "").astype(str)
-    lp_pseudo= _pick_series(log_period, ["Pseudo"], "").astype(str)
-
-    if not log_period.empty:
-        n_part = log_period.groupby(lp_tid).transform("size")
-        pts_row = (n_part - lp_pos + 1).clip(lower=1)
-        pts_total = int(pts_row[lp_pseudo == who].sum())
-    else:
-        pts_total = 0
-
-    # ---- TUILES (comme avant)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Parties", parties)
-    c2.metric("Victoires", wins)
-    c3.metric("ITM", f"{itm} ({pct_itm:.0f}%)")
-    c4.metric("Bulles", bulles)
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Buy-ins", euro(buyins))
-    c6.metric("Recaves (nb)", recaves_nb)
-    c7.metric("Recaves en €", euro(recaves_e))
-    c8.metric("Frais totaux", euro(total_fees))
-
-    c9, c10, c11, c12 = st.columns(4)
-    c9.metric("Gains (cash)", euro(g_cash))
-    c10.metric("Bounty", euro(g_bounty))
-    c11.metric("Gains totaux", euro(g_total))
-    c12.metric("Bénéfices", euro(net))
-
-    c13, c14, c15 = st.columns(3)
-    c13.metric("Place moyenne", f"{avg_finish:.2f}" if avg_finish else "—")
-    c14.metric("Points", pts_total)
-    c15.metric("ROI (total)", f"{roi_total:.0%}")
-
-    # ---- Graphiques
-    st.subheader("Évolution des bénéfices (cumul)")
-    evo = pd.DataFrame({
-        "Date": start_ts,
-        "Bénéfices": benef
-    }).dropna(subset=["Date"]).sort_values("Date")
-    if not evo.empty:
-        evo["Cumul"] = evo["Bénéfices"].cumsum()
-        st.altair_chart(
-            alt.Chart(evo).mark_line(point=True).encode(
-                x="Date:T", y="Cumul:Q"
-            ).properties(height=300),
-            use_container_width=True
+    try:
+        import pandas as pd
+        import numpy as np
+        import altair as alt
+        from datetime import date
+        from app_classement_unique import (
+            current_season_bounds, euro, parse_money, load_results_log_any
         )
-    else:
-        st.caption("Aucune donnée temporelle exploitable.")
 
-    st.subheader("Distribution des places")
-    places = pos[pos > 0]
-    if not places.empty:
-        dist = places.value_counts().sort_index().reset_index()
-        dist.columns = ["Place", "Occurrences"]
-        st.altair_chart(
-            alt.Chart(dist).mark_bar().encode(
-                x=alt.X("Place:O", sort="ascending"),
-                y="Occurrences:Q"
-            ).properties(height=260),
-            use_container_width=True
-        )
-    else:
-        st.caption("Aucune place enregistrée.")
+        st.title("Fiche joueur")
 
-    # ---- Historique détaillé
-    st.subheader("Historique")
-    hist = pd.DataFrame({
-        "Date": start_ts.dt.strftime("%Y-%m-%d %H:%M"),
-        "Tournoi": t_name,
-        "Place": pos,
-        "Reentry": reentry,
-        "Buy in": buyin_t.apply(euro),
-        "Frais": frais.apply(euro),
-        "GainsCash": gaincash.apply(euro),
-        "Bounty": bounty.apply(euro),
-        "Gains": gains_tot.apply(euro),
-        "Bénéfices": benef.apply(euro),
-    })
-    hist = hist.sort_values("Date")
-    st.dataframe(hist, use_container_width=True, hide_index=True)
+        log = load_results_log_any()
+        if log is None or log.empty:
+            st.info("Aucun historique pour l’instant.")
+            st.stop()
 
+        # --------- Helpers robustes (colonnes variables) ----------
+        def _pick_series(df: pd.DataFrame, candidates: list[str], default):
+            for c in candidates:
+                if c in df.columns:
+                    return df[c]
+            return pd.Series([default] * len(df), index=df.index)
+
+        # borne par saison (défaut = saison courante)
+        s0, s1 = current_season_bounds()
+        with st.expander("Filtrer par période (saison active par défaut)", expanded=False):
+            d1 = st.date_input("Du", value=s0)
+            d2 = st.date_input("Au", value=s1)
+
+        # choix du joueur (sans Winamax)
+        pseudos = sorted([p for p in log["Pseudo"].dropna().unique().tolist()
+                          if str(p).strip().lower() != "winamax"])
+        if not pseudos:
+            st.info("Aucun joueur trouvé.")
+            st.stop()
+        who = st.selectbox("Choisir un joueur", pseudos)
+
+        # sous-ensemble période + joueur
+        df = log.copy()
+        if "start_time" in df.columns and not df["start_time"].isna().all():
+            df["start_date"] = pd.to_datetime(df["start_time"]).dt.date
+            df = df[(df["start_date"] >= d1) & (df["start_date"] <= d2)]
+        df = df[df["Pseudo"] == who].copy()
+        if df.empty:
+            st.info("Pas de données pour ce joueur sur la période.")
+            st.stop()
+
+        # Colonnes clefs robustes
+        pos      = pd.to_numeric(_pick_series(df, ["Position", "Place", "Rank"], 0), errors="coerce").fillna(0).astype(int)
+        gaincash = _pick_series(df, ["GainsCash", "GainCash", "Gains"], 0.0).apply(parse_money).fillna(0.0)
+        bounty   = _pick_series(df, ["Bounty"], 0.0).apply(parse_money).fillna(0.0)
+        reentry  = pd.to_numeric(_pick_series(df, ["Reentry", "Re-entry"], 0), errors="coerce").fillna(0).astype(int)
+        buyin_t  = _pick_series(df, ["buyin_total", "buy_in_total", "Buy in total"], 0.0).apply(parse_money).fillna(0.0)
+        t_id     = _pick_series(df, ["tournament_id"], "").astype(str)
+        t_name   = _pick_series(df, ["tournament_name"], "").astype(str)
+        start_ts = pd.to_datetime(_pick_series(df, ["start_time"], pd.NaT), errors="coerce")
+
+        # ITM (cash hors bounty)
+        itm_flag = (gaincash > 0).astype(int)
+        # Victoires
+        win_flag = (pos == 1).astype(int)
+
+        # -------- Bulles (corrigé) : calculées sur le log complet, puis on regarde si 'who' est le 1er non-payé
+        def bubble_map(full_log: pd.DataFrame) -> dict:
+            if full_log.empty:
+                return {}
+            L = {}
+            g = full_log.copy()
+            g["gc"] = _pick_series(g, ["GainsCash", "GainCash", "Gains"], 0.0).apply(parse_money).fillna(0.0)
+            g["pos"] = pd.to_numeric(_pick_series(g, ["Position", "Place", "Rank"], 0), errors="coerce").fillna(0).astype(int)
+            for tid, grp in g.groupby(_pick_series(g, ["tournament_id"], "").astype(str)):
+                grp = grp.sort_values("pos")
+                no_paid = grp[grp["gc"] <= 0.0]
+                if no_paid.empty:
+                    continue
+                L[tid] = str(no_paid.iloc[0]["Pseudo"])
+            return L
+
+        bubbles_by_tid = bubble_map(log)
+        bubble_flag = t_id.map(lambda tid: 1 if bubbles_by_tid.get(tid) == who else 0)
+
+        # Recaves € / Frais / Gains totaux / Bénéfices
+        recaves_euro = reentry * buyin_t
+        frais = buyin_t + recaves_euro
+        gains_tot = gaincash + bounty
+        benef = gains_tot - frais
+
+        # ---- Agrégats
+        parties    = int(len(df))
+        wins       = int(win_flag.sum())
+        itm        = int(itm_flag.sum())
+        pct_itm    = (itm / parties) * 100 if parties else 0.0
+        bulles     = int(bubble_flag.sum())
+        recaves_nb = int(reentry.sum())
+        recaves_e  = float(recaves_euro.sum())
+        buyins     = float(buyin_t.sum())
+        total_fees = float(frais.sum())
+        g_cash     = float(gaincash.sum())
+        g_bounty   = float(bounty.sum())
+        g_total    = float(gains_tot.sum())
+        net        = float(benef.sum())
+        roi_total  = (g_total - total_fees) / total_fees if total_fees > 0 else 0.0  # ROI sur gains totaux uniquement
+        avg_finish = float(pos.replace(0, np.nan).mean()) if (pos > 0).any() else 0.0
+
+        # Points (formule N_participants - pos + 1, min=1) sur la période
+        log_period = log.copy()
+        if "start_time" in log_period.columns and not log_period["start_time"].isna().all():
+            log_period["start_date"] = pd.to_datetime(log_period["start_time"]).dt.date
+            log_period = log_period[(log_period["start_date"] >= d1) & (log_period["start_date"] <= d2)]
+        lp_pos   = pd.to_numeric(_pick_series(log_period, ["Position", "Place", "Rank"], 0), errors="coerce").fillna(0).astype(int)
+        lp_tid   = _pick_series(log_period, ["tournament_id"], "").astype(str)
+        lp_pseudo= _pick_series(log_period, ["Pseudo"], "").astype(str)
+
+        if not log_period.empty:
+            n_part = log_period.groupby(lp_tid).transform("size")
+            pts_row = (n_part - lp_pos + 1).clip(lower=1)
+            pts_total = int(pts_row[lp_pseudo == who].sum())
+        else:
+            pts_total = 0
+
+        # ---- TUILES (comme avant)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Parties", parties)
+        c2.metric("Victoires", wins)
+        c3.metric("ITM", f"{itm} ({pct_itm:.0f}%)")
+        c4.metric("Bulles", bulles)
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Buy-ins", euro(buyins))
+        c6.metric("Recaves (nb)", recaves_nb)
+        c7.metric("Recaves en €", euro(recaves_e))
+        c8.metric("Frais totaux", euro(total_fees))
+
+        c9, c10, c11, c12 = st.columns(4)
+        c9.metric("Gains (cash)", euro(g_cash))
+        c10.metric("Bounty", euro(g_bounty))
+        c11.metric("Gains totaux", euro(g_total))
+        c12.metric("Bénéfices", euro(net))
+
+        c13, c14, c15 = st.columns(3)
+        c13.metric("Place moyenne", f"{avg_finish:.2f}" if avg_finish else "—")
+        c14.metric("Points", pts_total)
+        c15.metric("ROI (total)", f"{roi_total:.0%}")
+
+        # ---- Graphiques
+        st.subheader("Évolution des bénéfices (cumul)")
+        evo = pd.DataFrame({
+            "Date": start_ts,
+            "Bénéfices": benef
+        }).dropna(subset=["Date"]).sort_values("Date")
+        if not evo.empty:
+            evo["Cumul"] = evo["Bénéfices"].cumsum()
+            st.altair_chart(
+                alt.Chart(evo).mark_line(point=True).encode(
+                    x="Date:T", y="Cumul:Q"
+                ).properties(height=300),
+                use_container_width=True
+            )
+        else:
+            st.caption("Aucune donnée temporelle exploitable.")
+
+        st.subheader("Distribution des places")
+        places = pos[pos > 0]
+        if not places.empty:
+            dist = places.value_counts().sort_index().reset_index()
+            dist.columns = ["Place", "Occurrences"]
+            st.altair_chart(
+                alt.Chart(dist).mark_bar().encode(
+                    x=alt.X("Place:O", sort="ascending"),
+                    y="Occurrences:Q"
+                ).properties(height=260),
+                use_container_width=True
+            )
+        else:
+            st.caption("Aucune place enregistrée.")
+
+        # ---- Historique détaillé
+        st.subheader("Historique")
+        hist = pd.DataFrame({
+            "Date": start_ts.dt.strftime("%Y-%m-%d %H:%M"),
+            "Tournoi": t_name,
+            "Place": pos,
+            "Reentry": reentry,
+            "Buy in": buyin_t.apply(euro),
+            "Frais": frais.apply(euro),
+            "GainsCash": gaincash.apply(euro),
+            "Bounty": bounty.apply(euro),
+            "Gains": gains_tot.apply(euro),
+            "Bénéfices": benef.apply(euro),
+        })
+        hist = hist.sort_values("Date")
+        st.dataframe(hist, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error("Erreur dans **Détails joueur**.")
+        st.exception(e)  # affiche le vrai message pour qu’on sache quoi corriger
+        if st.button("⬅️ Revenir au tableau"):
+            st.session_state["nav_main"] = "🏆 Tableau"
+            st.rerun()
 
 
 # =============================================================================
