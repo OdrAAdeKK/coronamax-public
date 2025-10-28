@@ -1,61 +1,25 @@
 # App.py
-
-import streamlit as st
-
-# Appel unique ET tout premier appel Streamlit
-if not st.session_state.get("_page_cfg_done"):
-    st.set_page_config(page_title="CoronaMax", page_icon="🏆", layout="wide")
-    st.session_state["_page_cfg_done"] = True
-
 from __future__ import annotations
 
+# --- stdlib imports
 import os, re, io, shutil
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
+# --- third-party imports
 import numpy as np
 import pandas as pd
+import streamlit as st
 
+# ---- Streamlit page config: exactly once, and as the first Streamlit call
+if not st.session_state.get("_page_cfg_done"):
+    st.set_page_config(page_title="CoronaMax", page_icon="🏆", layout="wide")
+    st.session_state["_page_cfg_done"] = True
 
-# --- tout en haut d'App.py ---
-
-
-
-
-# ensuite seulement : les autres imports qui utilisent streamlit,
-# st.session_state, st.sidebar, st.title, etc.
-
-
-try:
-    import App  # exécute App.py
-except Exception as e:
-    st.error("Erreur au démarrage de l'application (détails ci-dessous)")
-    st.exception(e)
-
-
-
-from app_classement_unique import (
-    BASE, ARCHIVE, PDF_DIR, PDF_DONE, SNAP_DIR, DATA_DIR,
-    RESULTS_LOG, JOURNAL_CSV,
-    RESULTS_LOG_COLUMNS, JOURNAL_COLUMNS,
-    parse_money, euro, current_season_bounds,
-    load_results_log_any, load_latest_master_any,
-    load_journal, save_journal, append_results_log,
-    extract_from_pdf, build_rows_for_log, build_manual_rows_for_log,
-    render_manual_results_pdf,
-    standings_from_log, compute_points_table,
-    compute_bubble_from_rows,
-    classement_df_to_jpg, classement_points_df_to_jpg,
-    archive_pdf, rollback_last_import,
-    publish_public_snapshot, safe_unlink,
-)
-
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Page config & CSS
-# -----------------------------------------------------------------------------
-
-
+# --------------------------------------------------------------------------
 HIDE_CHROME = """
 <style>
 /* masque le menu hamburger + footer streamlit en public */
