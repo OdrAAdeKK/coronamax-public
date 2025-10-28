@@ -3,7 +3,6 @@ pandas>=2.2
 numpy>=1.26
 altair>=5.2
 Pillow>=10.2
-# Si tu utilises PyMuPDF :
 PyMuPDF>=1.24
-# Si tu utilises OpenCV headless (facultatif si pas utilisé en Cloud) :
-opencv-python-headless>=4.9
+opencv-python-headless==4.10.0.84
+
