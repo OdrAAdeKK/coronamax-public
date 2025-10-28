@@ -12,6 +12,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from app_classement_unique import standings_from_log
+
+
 # ---- Streamlit page config: exactly once, and as the first Streamlit call
 if not st.session_state.get("_page_cfg_done"):
     st.set_page_config(page_title="CoronaMax", page_icon="🏆", layout="wide")
