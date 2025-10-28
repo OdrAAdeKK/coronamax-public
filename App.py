@@ -694,116 +694,120 @@ elif page == "⬆️ Importer":
             st.text("\n".join(logs))
         st.info("Faites défiler pour valider chaque tournoi.")
 
-# --- Saisie manuelle (NOUVEAU) -------------------------------------------
+    # --- Saisie manuelle (NOUVEAU) — visible uniquement en page Importer -----
+    with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
+        t_name = st.text_input("Nom du tournoi", placeholder="Ex. CoronaMax #123")
 
-with st.expander("➕ Saisie manuelle d'un tournoi (sans PDF)", expanded=False):
-    t_name = st.text_input("Nom du tournoi", placeholder="Ex. CoronaMax #123")
+        cdt, cht, cbi = st.columns([2, 1.3, 1.7])
+        with cdt:
+            t_date = st.date_input("Date", value=date.today(), key="manual_date")
+        with cht:
+            t_time = st.time_input(
+                "Heure",
+                value=datetime.now().replace(second=0, microsecond=0).time(),
+                key="manual_time",
+            )
+        with cbi:
+            t_buyin = st.number_input(
+                "Buy-in total (Buy-in + Rake)", min_value=0.0, step=0.5, format="%.2f", key="manual_buyin"
+            )
 
-    cdt, cht, cbi = st.columns([2, 1.3, 1.7])
-    with cdt:
-        t_date = st.date_input("Date", value=date.today(), key="manual_date")
-    with cht:
-        t_time = st.time_input("Heure", value=datetime.now().replace(second=0, microsecond=0).time(), key="manual_time")
-    with cbi:
-        t_buyin = st.number_input("Buy-in total (Buy-in + Rake)", min_value=0.0, step=0.5, format="%.2f", key="manual_buyin")
-
-    # --- Helpers roster (pseudos connus) ---------------------------------
-    def _load_roster() -> list[str]:
-        try:
-            from app_classement_unique import DATA_DIR, load_results_log_any
-            roster_csv = Path(DATA_DIR) / "players_roster.csv"
-            if roster_csv.exists():
-                df = pd.read_csv(roster_csv)
-                pseudos = df.get("Pseudo", pd.Series([], dtype=str)).astype(str).str.strip()
+        # --- Helpers roster (pseudos connus) ---------------------------------
+        def _load_roster() -> list[str]:
+            try:
+                from app_classement_unique import DATA_DIR, load_results_log_any
+                roster_csv = Path(DATA_DIR) / "players_roster.csv"
+                if roster_csv.exists():
+                    df = pd.read_csv(roster_csv)
+                    pseudos = df.get("Pseudo", pd.Series([], dtype=str)).astype(str).str.strip()
+                    return sorted({p for p in pseudos if p}, key=str.casefold)
+                # sinon on dérive du log actuel
+                log = load_results_log_any()
+                pseudos = log.get("Pseudo", pd.Series([], dtype=str)).astype(str).str.strip()
                 return sorted({p for p in pseudos if p}, key=str.casefold)
-            # sinon on dérive du log actuel
-            log = load_results_log_any()
-            pseudos = log.get("Pseudo", pd.Series([], dtype=str)).astype(str).str.strip()
-            return sorted({p for p in pseudos if p}, key=str.casefold)
-        except Exception:
-            return []
+            except Exception:
+                return []
 
-    def _save_roster(pseudos: list[str]) -> None:
+        def _save_roster(pseudos: list[str]) -> None:
+            try:
+                from app_classement_unique import DATA_DIR
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                roster_csv = Path(DATA_DIR) / "players_roster.csv"
+                df = pd.DataFrame(
+                    {"Pseudo": sorted({p.strip() for p in pseudos if isinstance(p, str) and p.strip()}, key=str.casefold)}
+                )
+                df.to_csv(roster_csv, index=False, encoding="utf-8")
+            except Exception as e:
+                print(f"[Importer] WARNING: save roster failed: {e}")
+
+        known_pseudos = _load_roster()
+        assist = st.toggle("Saisie assistée (auto-complétion des pseudos)", value=True, key="manual_assist")
+
+        # Table d'édition des lignes
+        if "manual_rows_df" not in st.session_state:
+            st.session_state.manual_rows_df = pd.DataFrame([
+                {"Position": 1, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
+                {"Position": 2, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
+                {"Position": 3, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
+            ])
+
+        colcfg = {
+            "Position": st.column_config.NumberColumn("Position", step=1, format="%d", help="Place (1,2,3,...)"),
+            "Pseudo": (
+                st.column_config.SelectboxColumn(
+                    "Pseudo", options=known_pseudos, help="Tape pour filtrer les pseudos connus"
+                ) if assist else st.column_config.TextColumn("Pseudo", help="Saisie libre")
+            ),
+            "GainsCash": st.column_config.NumberColumn("Gains (€)", format="%.2f", help="Gains cash"),
+            "Bounty": st.column_config.NumberColumn("Bounty (€)", format="%.2f"),
+            "Reentry": st.column_config.NumberColumn("Recaves", step=1, format="%d"),
+        }
+
+        manual_edit = st.data_editor(
+            st.session_state.manual_rows_df,
+            num_rows="dynamic",
+            use_container_width=True,   # ✅ à la place de width="stretch"
+            hide_index=True,
+            key="manual_editor",
+            column_config=colcfg,
+        )
+
+        # Aperçu bulle
         try:
-            from app_classement_unique import DATA_DIR
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            roster_csv = Path(DATA_DIR) / "players_roster.csv"
-            df = pd.DataFrame({"Pseudo": sorted({p.strip() for p in pseudos if isinstance(p, str) and p.strip()}, key=str.casefold)})
-            df.to_csv(roster_csv, index=False, encoding="utf-8")
-        except Exception as e:
-            print(f"[Importer] WARNING: save roster failed: {e}")
+            _bubble = compute_bubble_from_rows(manual_edit)
+            st.caption(f"Bulle détectée : **{_bubble or '(aucune)'}**")
+        except Exception:
+            pass
 
-    known_pseudos = _load_roster()
-    assist = st.toggle("Saisie assistée (auto-complétion des pseudos)", value=True, key="manual_assist")
-
-    # Table d'édition des lignes
-    if "manual_rows_df" not in st.session_state:
-        st.session_state.manual_rows_df = pd.DataFrame([
-            {"Position": 1, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
-            {"Position": 2, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
-            {"Position": 3, "Pseudo": "", "GainsCash": 0.0, "Bounty": 0.0, "Reentry": 0},
-        ])
-
-    colcfg = {
-        "Position": st.column_config.NumberColumn("Position", step=1, format="%d", help="Place (1,2,3,...)"),
-        "Pseudo": (
-            st.column_config.SelectboxColumn(
-                "Pseudo",
-                options=known_pseudos,
-                help="Tape pour filtrer les pseudos connus"
-            ) if assist else st.column_config.TextColumn("Pseudo", help="Saisie libre")
-        ),
-        "GainsCash": st.column_config.NumberColumn("Gains (€)", format="%.2f", help="Gains cash"),
-        "Bounty": st.column_config.NumberColumn("Bounty (€)", format="%.2f"),
-        "Reentry": st.column_config.NumberColumn("Recaves", step=1, format="%d"),
-    }
-
-    manual_edit = st.data_editor(
-        st.session_state.manual_rows_df,
-        num_rows="dynamic",
-        use_container_width=True,   # ✅ à la place de width="stretch"
-        hide_index=True,
-        key="manual_editor",
-        column_config=colcfg,
-    )
-
-
-    # Aperçu bulle
-    try:
-        _bubble = compute_bubble_from_rows(manual_edit)
-        st.caption(f"Bulle détectée : **{_bubble or '(aucune)'}**")
-    except Exception:
-        pass
-
-    # Mise en file
-    if st.button("➕ Mettre en file (saisie manuelle)", type="primary", key="manual_queue"):
-        if not t_name.strip():
-            st.warning("Renseigne d'abord le nom du tournoi.")
-        else:
-            dt = datetime.combine(t_date, t_time)
-            df_manual = build_manual_rows_for_log(t_name.strip(), dt, float(t_buyin), manual_edit.copy())
-            # filtre sécurité : au moins 1 pseudo non vide
-            has_rows = (df_manual["Pseudo"].astype(str).str.strip() != "").any()
-            if not has_rows:
-                st.warning("Ajoute au moins une ligne avec un pseudo.")
+        # Mise en file
+        if st.button("➕ Mettre en file (saisie manuelle)", type="primary", key="manual_queue"):
+            if not t_name.strip():
+                st.warning("Renseigne d'abord le nom du tournoi.")
             else:
-                # Mettre à jour le roster dès maintenant (optionnel mais pratique)
-                try:
-                    new_pseudos = df_manual["Pseudo"].astype(str).str.strip().tolist()
-                    merged = sorted(set(known_pseudos) | {p for p in new_pseudos if p}, key=str.casefold)
-                    _save_roster(merged)
-                except Exception as e:
-                    print(f"[Importer] WARNING: roster update failed: {e}")
+                dt = datetime.combine(t_date, t_time)
+                df_manual = build_manual_rows_for_log(t_name.strip(), dt, float(t_buyin), manual_edit.copy())
+                # filtre sécurité : au moins 1 pseudo non vide
+                has_rows = (df_manual["Pseudo"].astype(str).str.strip() != "").any()
+                if not has_rows:
+                    st.warning("Ajoute au moins une ligne avec un pseudo.")
+                else:
+                    # Mettre à jour le roster dès maintenant (optionnel mais pratique)
+                    try:
+                        new_pseudos = df_manual["Pseudo"].astype(str).str.strip().tolist()
+                        merged = sorted(set(known_pseudos) | {p for p in new_pseudos if p}, key=str.casefold)
+                        _save_roster(merged)
+                    except Exception as e:
+                        print(f"[Importer] WARNING: roster update failed: {e}")
 
-                tid = str(df_manual["tournament_id"].iloc[0])
-                st.session_state.pending_tourneys[tid] = {
-                    "df": df_manual,
-                    "src_path": "",  # pas de PDF
-                    "name": t_name.strip(),
-                    "start_time": dt,
-                    "is_manual": True,
-                }
-                st.success(f"✅ Ajouté : {t_name.strip()} — {len(df_manual)} ligne(s)")
+                    tid = str(df_manual["tournament_id"].iloc[0])
+                    st.session_state.pending_tourneys[tid] = {
+                        "df": df_manual,
+                        "src_path": "",  # pas de PDF
+                        "name": t_name.strip(),
+                        "start_time": dt,
+                        "is_manual": True,
+                    }
+                    st.success(f"✅ Ajouté : {t_name.strip()} — {len(df_manual)} ligne(s)")
 
 
 
