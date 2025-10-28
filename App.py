@@ -1,4 +1,12 @@
 # App.py
+
+import streamlit as st
+
+# Appel unique ET tout premier appel Streamlit
+if not st.session_state.get("_page_cfg_done"):
+    st.set_page_config(page_title="CoronaMax", page_icon="🏆", layout="wide")
+    st.session_state["_page_cfg_done"] = True
+
 from __future__ import annotations
 
 import os, re, io, shutil
@@ -10,7 +18,14 @@ import numpy as np
 import pandas as pd
 
 
-import streamlit as st
+# --- tout en haut d'App.py ---
+
+
+
+
+# ensuite seulement : les autres imports qui utilisent streamlit,
+# st.session_state, st.sidebar, st.title, etc.
+
 
 try:
     import App  # exécute App.py
@@ -39,7 +54,7 @@ from app_classement_unique import (
 # -----------------------------------------------------------------------------
 # Page config & CSS
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="CoronaMax", page_icon="🏆", layout="wide")
+
 
 HIDE_CHROME = """
 <style>
