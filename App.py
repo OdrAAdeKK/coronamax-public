@@ -81,22 +81,14 @@ def _selectbox_col(label: str, options: list[str], **kwargs):
 from datetime import date  # (si pas déjà importé au-dessus)
 
 def current_season_bounds(today: date | None = None) -> tuple[date, date]:
-    """
-    Saison qui va du 1er septembre au 31 août.
-    - Si on est entre sept. et déc. -> [1 sept année courante ; 31 août année suivante]
-    - Si on est entre janv. et août -> [1 sept année précédente ; 31 août année courante]
-    """
+    from datetime import date as _date
     if today is None:
-        today = date.today()
+        today = _date.today()
+    year = today.year
+    s0 = _date(year if today >= _date(year, 8, 1) else year - 1, 8, 1)
+    s1 = _date(s0.year + 1, 7, 31)
+    return s0, s1
 
-    if today.month >= 9:
-        start = date(today.year, 9, 1)
-        end   = date(today.year + 1, 8, 31)
-    else:
-        start = date(today.year - 1, 9, 1)
-        end   = date(today.year, 8, 31)
-
-    return start, end
 
 def season_label(start: date, end: date) -> str:
     """Ex.: Saison 24/25"""
